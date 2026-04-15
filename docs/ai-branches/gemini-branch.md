@@ -119,7 +119,7 @@ Most systems decay over time. MarketMuse is designed to grow its edge.
 
 ---
 
-# ROUND 2 — DATA & INFRASTRUCTURE GAP REPORT
+# ROUND 2 — DATA & INFRASTRUCTURE AUDIT
 
 **Date:** April 15, 2026  
 **Status:** Round 2 — Challenge/Review of SYNTHESIS.md  
@@ -127,152 +127,104 @@ Most systems decay over time. MarketMuse is designed to grow its edge.
 
 ---
 
-## Pillar 1: Prediction Engine (Three-Layer Forecast Stack)
+## DATA & INFRASTRUCTURE AUDIT — PILLAR 1: PREDICTION ENGINE
 
-### Data required vs data available
+### Gap 1: The GEX "Lag-to-Loss" Loop
 
-- **Required:** Real-time GEX requires CBOE DataShop OI feeds. Intraday GEX walls need live Open Interest (OI) updates.
-- **Gap:** Tradier OI data typically lags (updated once daily). Using Tradier for GEX leads to "stale signal" risk where the system trades against non-existent walls.
-- **Latency:** High-fidelity HMM regime detection requires 60-second updates on VIX/VVIX and /ES futures.
+- **Data required:** Real-time Gamma Exposure (GEX) levels and strike-specific Open Interest (OI) updates.
+- **Data reality:** Tradier (and most retail APIs) updates Open Interest once per day (pre-market). Intraday GEX changes—driven by 0DTE volume—are invisible using standard OI feeds.
+- **Failure mode:** The system identifies a "Gamma Wall" at 5100 that was neutralized three hours ago. It enters a mean-reversion trade that gets run over by a trend, resulting in a max-loss stop.
+- **Cold-start risk:** High. Without historical intraday OI/Volume correlations, the GEX engine is guessing on Day 1.
+- **Fix:** Ingest CBOE LiveVol or Databento OPRA trade-by-trade feeds to calculate "Synthetic GEX" based on intraday volume flow rather than static morning OI.
 
-### Infrastructure required vs realistic constraints
+### Gap 2: Regime Drift vs. HMM Latency
 
-- **Required:** QuestDB for sub-millisecond time-series storage of ~87 features per 5-minute cycle.
-- **Constraint:** Managing a multi-node QuestDB cluster for high availability is complex. Single-point-of-failure risk if the DB ingestor hangs.
+- **Data required:** 60-second Viterbi path updates from a Hidden Markov Model (HMM).
+- **Data reality:** Calculating HMM states on high-dimensional feature sets (87 features) every minute is computationally expensive. If the QuestDB ingestor or the Python inference script lags by even 30 seconds, the regime signal is stale.
+- **Failure mode:** The market transitions from "Quiet Bullish" to "Crisis" during a CPI print. The system, lagging by one minute, buys a "dip" that is actually the start of a liquidation event.
+- **Cold-start risk:** The HMM requires a "burn-in" period. Day 1 will see frequent "state-flipping" (instability).
+- **Fix:** Move HMM inference to C++ or highly optimized Rust microservices. Reduce feature set to the "Top 5" most predictive for regime detection to ensure sub-second inference.
 
-### Cold-start risk: HIGH
+### Gap 3: The "Broken Pipe" Signal
 
-The LightGBM Day Type Classifier requires ~5 years of historical SPX 5-minute data to be profitable on Day 1. Without pre-loaded historicals, the regime engine is blind.
-
-### Recommended fix
-
-Purchase historical 1-minute SPX/OPRA data from Databento/CBOE for pre-training. Implement a **"Shadow Data Ingestor"** that compares Tradier OI vs CBOE DataShop in real-time to quantify lag-induced error.
-
----
-
-## Pillar 2: Strategy Selection (EV-Based Ranking)
-
-### Data required vs data available
-
-- **Required:** Real-time Greeks (Delta, Gamma, Theta, Vega) across the entire SPX chain.
-- **Gap:** Tradier's free tier has rate limits on chain requests. Calculating EV for "all candidate strategies" might exceed API quotas during high-volatility spikes when the engine needs to re-scan.
-
-### Infrastructure required vs realistic constraints
-
-- **Required:** A "Strategy Simulator" that can Monte Carlo 1,000+ paths for 50+ strategy candidates every 5 minutes.
-- **Constraint:** This requires significant CPU/RAM if not optimized. Python-based loops will be too slow; requires Rust or C++ backends.
-
-### Cold-start risk: LOW
-
-Provided the Prediction Engine (Pillar 1) is functional. However, without historical slippage data, the EV calculation will be overly optimistic.
-
-### Recommended fix
-
-Implement **"Slippage-Adjusted EV."** On Day 1, assume 2x the bid/ask spread as a penalty. Gradually reduce this penalty as real trade data is ingested into the Learning Engine.
+- **Data required:** Continuous WebSocket stream of Greeks and NBBO.
+- **Data reality:** WebSockets drop. Tradier's sandbox and production environments have documented "silent timeouts" where the socket stays open but data stops flowing.
+- **Failure mode:** The prediction engine "freezes" on the last known price. The market moves 0.5%, but the system thinks it's still in a "Low Vol" regime, failing to trigger an exit.
+- **Cold-start risk:** Day 1 will likely suffer from unhandled connection exceptions.
+- **Fix:** Implement a **Heartbeat Monitor**. If no data is received for 3 seconds, the system must immediately switch to a "Degraded Mode" (polling REST API) or flatten positions.
 
 ---
 
-## Pillar 3: Risk Management (The Iron Guard)
+## DATA & INFRASTRUCTURE AUDIT — PILLAR 2: STRATEGY SELECTION
 
-### Data required vs data available
+### Gap 1: The EV Over-Optimization Trap
 
-- **Required:** Continuous VVIX stream and real-time P&L.
-- **Gap:** If the Tradier WebSocket disconnects, the system may miss the -3% hard daily stop trigger.
+- **Data required:** Real-time IV Surface to calculate Expected Value (EV) for 50+ strategy candidates.
+- **Data reality:** Tradier rate limits (approx. 120 calls/min for some endpoints) make fetching the entire option chain + Greeks for SPX, NDX, and RUT simultaneously impossible during high-velocity re-scans.
+- **Failure mode:** The system misses the "Optimal" strategy because the API call was throttled, settling for a sub-optimal "cached" strategy from 5 minutes ago.
+- **Cold-start risk:** EV calculations will be "too perfect" (0% slippage assumed) on Day 1, leading to over-leveraging.
+- **Fix:** Implement a **Priority Fetcher**. Scan only strikes within +/- 2% of Spot first. Use a local Black-Scholes/Greeks engine to calculate values locally instead of requesting them from the API.
 
-### Infrastructure required vs realistic constraints
+### Gap 2: Infrastructure "Compute Debt"
 
-- **Required:** An **"Out-of-Band" (OOB) monitor.**
-- **Constraint:** Most retail setups run everything on one server. If that server fails, there is no risk management.
+- **Data required:** Monte Carlo path validation for strategy candidates.
+- **Data reality:** Running 10,000 simulations per strategy for 50 candidates every 5 minutes requires a beefy multi-core server. A standard $20/mo VPS will hang.
+- **Failure mode:** The "Strategy Selector" takes 4 minutes to calculate. By the time it suggests a trade, the opportunity (and the price) has moved.
+- **Cold-start risk:** Total system lockup on Day 1 due to resource exhaustion.
+- **Fix:** Use AWS Lambda for parallelized Monte Carlo simulations or utilize **Numba** for JIT-compiled Python performance.
 
-### Cold-start risk: NONE
+### Gap 3: Tax-Alpha Ignorance
 
-Risk rules are hardcoded (e.g., -3% stop).
-
-### Recommended fix
-
-Deploy the Risk Monitor as a **separate microservice on a distinct cloud region** (e.g., AWS Lambda) that monitors the account via REST API independently of the main execution WebSocket.
-
----
-
-## Pillar 4: Dashboard & Monitoring Intelligence (The War Room)
-
-### Data required vs data available
-
-- **Required:** Real-time Greek exposure heatmap.
-- **Gap:** Visualizing "P&L Curves" for complex spreads (Iron Condors) requires real-time IV surface interpolation, which is computationally expensive to stream to a frontend.
-
-### Infrastructure required vs realistic constraints
-
-- **Required:** WebSocket-based frontend updates for sub-second latency.
-- **Constraint:** Browser-side rendering of complex heatmaps can lag on standard hardware if the data packet size is too large.
-
-### Cold-start risk: LOW
-
-The dashboard is a "Window," not a "Driver."
-
-### Recommended fix
-
-Use **Plotly.js with WebGL** for GPU-accelerated rendering. Compute the "P&L Curve" server-side in the Strategy Engine and only send the coordinate array to the frontend.
+- **Data required:** Net after-tax P&L forecasting.
+- **Data reality:** The synthesis assumes 60/40 tax treatment but doesn't account for "Wash Sales" or the accounting complexity of mixed-index trading.
+- **Failure mode:** The system selects a strategy with higher gross profit but lower net after-tax profit because it fails to account for a disallowed loss.
+- **Fix:** Integrate a **Tax-Aware Utility Function** into the EV ranking that penalizes trades with poor tax implications.
 
 ---
 
-## Pillar 5: Exit Strategy
+## DATA & INFRASTRUCTURE AUDIT — PILLAR 3: RISK MANAGEMENT
 
-### Data required vs data available
+### Gap 1: The "Single Point of Failure" Dashboard
 
-- **Required:** Strike-touch probability and 2:30 PM gamma-risk triggers.
-- **Gap:** Requires sub-minute monitoring of "Delta Drift".
+- **Data required:** Real-time account equity and drawdown metrics.
+- **Data reality:** If the primary trading server goes down, the "Dashboard" (which usually runs on the same server) also dies. The trader is blind.
+- **Failure mode:** A "Flash Crash" happens. The server crashes due to data overflow. The -3% Hard Stop never fires because the logic was on the crashed server.
+- **Cold-start risk:** No "Emergency Manual Override" protocol tested on Day 1.
+- **Fix:** Deploy an **Independent Sentinel** on a separate cloud provider (e.g., Google Cloud if the main is AWS) that only has "Close Only" permissions.
 
-### Infrastructure required vs realistic constraints
+### Gap 2: Slippage Underestimation in RUT
 
-- **Required:** Automated OCO (One-Cancels-Other) order management at the broker level.
-- **Constraint:** If Tradier's OCO fails server-side (common in high vol), the system must have local logic to "clean up" the orphaned leg.
+- **Data required:** Liquidity/Spread depth for RUT options.
+- **Data reality:** RUT liquidity is significantly thinner than SPX. The synthesis assumes "Institutional execution" but Tradier is a retail pipe.
+- **Failure mode:** The system attempts a large Iron Condor in RUT. Slippage eats 20% of the credit on entry and 20% on exit. The "Profitable" trade becomes a net loss.
+- **Fix:** Apply a **Liquidity Penalty Multiplier** to all RUT and NDX trades in the Strategy Selector.
 
-### Cold-start risk: MEDIUM
+### Gap 3: The "approval_timeout" Profit Killer
 
-Strike-touch probabilities are derived from models that need calibration.
-
-### Recommended fix
-
-V1 should use **"Hard Local Stops"** — the system sends the exit order as a standard Limit/Market order rather than relying purely on broker-side OCO.
-
----
-
-## Pillar 6: Learning Engine (The Data Flywheel)
-
-### Data required vs data available
-
-- **Required:** Full trade audit logs (entry/exit Greeks, regime state).
-- **Gap:** "Counterfactual Backtesting" requires storing the entire options chain state for the duration of the trade, not just the strikes traded. This is TBs of data over time.
-
-### Infrastructure required vs realistic constraints
-
-- **Required:** S3-compatible storage for "Full Chain Dumps" and a two-speed learning loop (Daily/Weekly).
-- **Constraint:** Storage costs for full OPRA feeds can exceed $1,000/month.
-
-### Cold-start risk: CRITICAL
-
-The engine has nothing to learn from on Day 1.
-
-### Recommended fix
-
-Prioritize **"Feature Importance" logging.** Instead of storing the full chain, store the top 50 features from the Prediction Engine at the time of trade. This reduces storage by 99% while retaining 90% of the learning value.
+- **Data required:** Human approval within 8 minutes.
+- **Data reality:** In 0DTE trading, an 8-minute window is an eternity.
+- **Failure mode:** The system spots a "Gamma Squeeze" entry. The human is in the bathroom. By minute 7, the move is over. The human approves anyway (FOMO), and the trade enters at the top, immediately hitting a stop.
+- **Fix:** Reduce timeout to **60 seconds**. If not approved, the trade is voided. No exceptions.
 
 ---
 
-## THE MINIMUM VIABLE DATA STACK (Ranked by ROI)
+## THE MINIMUM VIABLE DATA STACK (ROI RANKED)
 
-| Priority | Component | Technology | Cost/Month | Profit Justification (ROI) |
+| Priority | Component | Technology | Cost/Mo | Profit Justification |
 |---|---|---|---|---|
-| 1 | Primary Feed | Tradier Streaming API | $0 (with account) | Core execution; non-negotiable for live trading |
-| 2 | GEX Engine | CBOE DataShop (OI Only) | ~$200–$500 | Highest ROI. Prevents "Blind Shorting" into negative GEX zones |
-| 3 | Time-Series DB | QuestDB (Open Source) | $0 (Self-hosted) | Essential for real-time feature engineering and HMM regime detection |
-| 4 | Historical Data | Databento (Pay-per-GB) | ~$100 (One-time) | Fixes the cold-start problem for Pillar 1 Day Type classification |
-| 5 | Risk Monitor | AWS Lambda (OOB) | <$10 | Prevents catastrophic failure if the main server/broker connection hangs |
+| 1 | Primary Pipe | Tradier API | $0 | Base execution |
+| 2 | Time-Series | QuestDB (Self-Hosted) | $0 | Fast feature storage; essential for regime detection |
+| 3 | Intraday Edge | Databento (Live Feed) | ~$150 | Highest ROI. Provides trade-by-trade data needed for real GEX |
+| 4 | Off-Server Risk | AWS Lambda / SNS | ~$10 | Essential "Insurance" to kill trades if main server dies |
+| 5 | Historicals | Polygon.io (1-mo sub) | $200 | One-time cost to solve the Day 1 cold-start problem |
 
-**Total Estimated OpEx: ~$310–$610/month**
+---
 
-This stack provides 95% of the edge described in SYNTHESIS.md at <10% of the cost of a full institutional data terminal.
+## THE OPERATIONAL GAP THAT WILL CAUSE THE FIRST LIVE FAILURE
+
+**The "WebSocket-Stale-State" Error.**
+
+The most likely failure is that the Tradier WebSocket will drop or lag during a high-volatility event (e.g., FOMC meeting). The system will continue to calculate Greeks and EV based on "Price: 5150" when the market is actually at 5120. It will execute a "limit order" that never fills, or worse, a "market order" with 500% more slippage than expected, blowing through the daily risk limit in seconds.
 
 ---
 
