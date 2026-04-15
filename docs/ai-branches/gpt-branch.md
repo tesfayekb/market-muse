@@ -865,4 +865,305 @@ The synthesis is directionally strong, but the current version contains too many
 
 ---
 
+---
+
+# ROUND 3 — GPT Response: Q3 — First-Passage Touch Probability Calibration
+
+**Assignment:** Q3 — First-Passage Touch Probability Calibration
+
+---
+
+## 1) DATA LOGGING (EVERY 5 MINUTES — EXHAUSTIVE, BUILDABLE)
+
+You need three layers of data: state, formula inputs, and outcome truth.
+
+### A. Core identifiers
+
+| Field | Type |
+|---|---|
+| position_id | UUID |
+| obs_ts_utc | TIMESTAMP |
+| minutes_to_230 | INT |
+| strategy_type | TEXT |
+| underlying | TEXT |
+
+### B. Market + state snapshot
+
+| Field | Type |
+|---|---|
+| spx_last | FLOAT |
+| spx_return_5m | FLOAT |
+| spx_return_30m | FLOAT |
+| vix | FLOAT |
+| vvix | FLOAT |
+| vvix_change_30m_pct | FLOAT |
+| regime | TEXT |
+| rcs | FLOAT |
+| cv_stress_score | FLOAT |
+| charm_velocity | FLOAT |
+| vanna_velocity | FLOAT |
+
+### C. Position state
+
+| Field | Type |
+|---|---|
+| short_put_strike | FLOAT |
+| short_call_strike | FLOAT |
+| position_mid_price | FLOAT |
+| position_unrealized_pnl | FLOAT |
+| position_delta | FLOAT |
+| position_gamma | FLOAT |
+| spread_width | FLOAT |
+| slippage_estimate_exit | FLOAT |
+
+### D. Formula inputs (CRITICAL — must be logged raw + adjusted)
+
+| Field | Type |
+|---|---|
+| mu_30m_annualized | FLOAT |
+| sigma_30m_raw | FLOAT |
+| sigma_5m | FLOAT |
+| sigma_effective | FLOAT |
+| T_years_to_230 | FLOAT |
+| T_minutes_to_230 | FLOAT |
+| ln_k_over_s_put | FLOAT |
+| ln_k_over_s_call | FLOAT |
+
+### E. Formula outputs
+
+| Field | Type |
+|---|---|
+| touch_prob_put | FLOAT |
+| touch_prob_call | FLOAT |
+| touch_prob_max | FLOAT |
+| d1_put | FLOAT |
+| d2_put | FLOAT |
+| d1_call | FLOAT |
+| d2_call | FLOAT |
+| formula_edge_case | TEXT |
+
+### F. Outcome truth labels (post-session reconciliation)
+
+| Field | Type |
+|---|---|
+| put_touched_by_230 | BOOLEAN |
+| call_touched_by_230 | BOOLEAN |
+| any_touch_by_230 | BOOLEAN |
+| first_touch_ts | TIMESTAMP |
+| minutes_to_touch | FLOAT |
+
+### G. Decision simulation (for calibration)
+
+| Field | Type |
+|---|---|
+| exit_now_pnl_after_slippage | FLOAT |
+| hold_to_230_realized_pnl | FLOAT |
+| giveback_if_hold | FLOAT |
+| false_exit_cost | FLOAT |
+| missed_exit_cost | FLOAT |
+
+---
+
+## 2) VALIDATION METRIC (FORMULA QUALITY)
+
+### PRIMARY: Weighted Brier Score
+
+```python
+y = 1 if touch else 0
+p = touch_prob_max
+
+weight = 2.0 if pnl > 0.4 * max_profit else 1.0
+
+brier = weight * (p - y)**2
+```
+
+### REQUIRED TARGETS
+
+- Brier improvement ≥ 10% vs baseline
+- ECE ≤ 0.05
+- Late-window (≤30 min) ECE ≤ 0.08
+
+### BASELINES (MUST BEAT)
+
+- Distance-only model
+- Distance + realized vol model
+
+**If not → formula not deployable**
+
+---
+
+## 3) THRESHOLD CALIBRATION
+
+### CORRECT OBJECTIVE (THIS IS KEY)
+
+**NOT accuracy.**
+
+Optimize:
+- **Maximize:** Net Retained P&L after slippage
+- **Penalty:** Missed exits > false exits
+
+### OBJECTIVE FUNCTION
+
+```python
+score = mean(retained_pnl)
+      - 0.75 * missed_exit_cost
+      - 0.50 * false_exit_cost
+      - 0.5 * downside_variance
+```
+
+### OPTIMIZATION METHOD
+
+**Step 1: Grid search (MANDATORY first)**
+
+```python
+warn =    [0.05, 0.075, 0.10, 0.125, 0.15]
+partial = [0.15, 0.20, 0.25, 0.30, 0.35]
+full =    [0.30, 0.35, 0.40, 0.45, 0.50]
+```
+
+**Constraint:** `warn < partial < full`
+
+**Step 2: Replay engine**
+- Replay every 5-min snapshot
+- Apply threshold policy
+- Use realistic slippage model (time-of-day adjusted)
+
+**Step 3: Select Pareto frontier**
+
+Keep only threshold sets that:
+- maximize retained P&L
+- minimize catastrophic giveback
+
+### SAMPLE SIZE REQUIREMENT
+
+**Minimum per strategy:**
+- ≥ 150 observations
+- ≥ 80 positions
+- ≥ 40 actual touches
+- ≥ 40 triggered exits
+
+**Preferred:**
+- ≥ 250 observations
+- ≥ 60 touches
+- ≥ 3 regimes covered
+
+---
+
+## 4) REALIZED VOL VS IMPLIED VOL
+
+### BASE RULE
+
+Use realized vol → correct for path modeling.
+
+### FAILURE MODE (CRITICAL)
+
+When:
+- regime shifts fast
+- realized 30m still low
+- volatility just started expanding
+
+→ touch probability is **underestimated**
+
+### FIX (MANDATORY)
+
+```python
+sigma_effective = max(
+    sigma_30m,
+    sigma_5m * 0.75,
+    sigma_10m * 0.85
+)
+
+if vvix_change_30m_pct > 20 or abs(spx_return_5m) > 0.35%:
+    sigma_effective = max(sigma_effective, sigma_5m)
+```
+
+---
+
+## 5) PYTHON IMPLEMENTATION (PRODUCTION SAFE)
+
+```python
+from math import log, sqrt, exp
+from scipy.stats import norm
+
+MIN_SIGMA = 1e-4
+MIN_T = 1/(252*390)
+
+def touch_prob(S, K, mu, sigma, T):
+    # Edge: invalid
+    if S <= 0 or K <= 0:
+        return 1.0
+
+    # Edge: already at strike
+    if abs(S - K) < 1e-8:
+        return 1.0
+
+    sigma = max(sigma, MIN_SIGMA)
+    T = max(T, MIN_T)
+
+    vol = sigma * sqrt(T)
+
+    d1 = (log(S/K) + (mu + 0.5*sigma**2)*T) / vol
+    d2 = d1 - vol
+
+    exponent = (2 * mu * log(K/S)) / (sigma**2)
+    exponent = max(min(exponent, 50), -50)
+
+    p = norm.cdf(-d2) + exp(exponent) * norm.cdf(-d1)
+
+    return max(0.0, min(1.0, p))
+```
+
+### EDGE CASE RULES
+
+| Case | Behavior |
+|---|---|
+| T → 0 | clamp to 1 minute |
+| S = K | return 1.0 |
+| sigma → 0 | floor |
+| fast market | recompute immediately |
+
+---
+
+## 6) MINIMUM OBSERVATIONS BEFORE LIVE DEPLOYMENT
+
+### STRICT minimum:
+
+- 150 observations
+- 80 trades
+- 40 touches
+- 40 exits
+
+### PREFERRED:
+
+- 250 observations
+- 60 touches
+- multi-regime coverage
+
+### If NOT met:
+
+- → keep priors (10/25/40)
+- → reduce live size to 50%
+
+---
+
+## FINAL — WHAT ACTUALLY DRIVES PROFIT HERE
+
+**The formula itself is NOT the edge.**
+
+The edge is:
+1. **Correct calibration** of probability
+2. **Correct threshold placement**
+3. **Correct slippage-aware exit timing**
+
+If calibration is off:
+- you exit too early → lose theta
+- you exit too late → give back convex loss
+
+This module directly controls:
+👉 **profit retention vs giveback**
+
+It is one of the highest leverage components in the entire system.
+
+---
+
 *Document maintained by: GPT-5.4 Thinking (OpenAI) | Repo: https://github.com/tesfayekb/market-muse.git*
