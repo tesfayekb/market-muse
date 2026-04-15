@@ -228,4 +228,127 @@ The most likely failure is that the Tradier WebSocket will drop or lag during a 
 
 ---
 
+---
+
+# ROUND 3 — Gemini Branch Refinement (LOCKED)
+
+**Status:** Round 3 Refinement (LOCKED)  
+**Primary AI:** Gemini 1.5 Pro  
+**Scope:** Q2 (Independent Sentinel) & Q4 (Databento GEX Integration)
+
+---
+
+## QUESTION 2 — INDEPENDENT SENTINEL FULL SPECIFICATION
+
+The Sentinel is the "Dead Man's Switch." It must be **dumb, robust, and pessimistic.** It is deployed on **GCP (Google Cloud Platform)** to ensure a cloud-provider failure at AWS does not blind the system.
+
+### 2.1 Tradier API Interaction
+
+The Sentinel polls Tradier directly to verify state independently of the primary app's database.
+
+| Endpoint | Frequency | Extracted Data | Purpose |
+|---|---|---|---|
+| `GET /v1/accounts/{id}/balances` | 5s | total_equity, market_value | Monitor for -3% Drawdown trigger. |
+| `GET /v1/accounts/{id}/positions` | 10s | symbol, quantity, id | Maintain a list of open legs for emergency liquidation. |
+| `GET /v1/markets/quotes?symbols=SPX` | 2s | last, change_percentage | Monitor for -2.5% SPX 30-min drop (Circuit Breaker). |
+
+### 2.2 Heartbeat Mechanism: "The Pulse"
+
+To avoid cloud-to-cloud networking complexities, the Sentinel uses a **Reverse-Proxy Health Check:**
+
+- **Mechanism:** The Primary App (AWS) updates a dedicated heartbeat key in a TimescaleDB table (`system_health`) every 10 seconds.
+- **Sentinel Logic:** The Sentinel queries this table via a read-only database replica.
+- **Timeout:** If `current_timestamp - last_heartbeat > 120 seconds`, the Sentinel initiates "Degraded Check." It attempts one HTTP ping to the Primary App's health endpoint. If that fails, it assumes Primary App failure and triggers **Panic Mode (Close All).**
+
+### 2.3 Who Monitors the Monitor?
+
+To prevent infinite regress:
+
+- **Sentinel Health:** The Sentinel process is wrapped in a **GCP Cloud Run "always-on" service** with a standard health check.
+- **The Human Alert:** We use **UptimeRobot (External)** to monitor a public-facing health endpoint on the Sentinel. If the Sentinel stops responding, it sends a high-priority SMS/PagerDuty alert to the developer. The Sentinel is not self-healing; its failure is a "Stop Trading" event for the human.
+
+### 2.4 Panic Mode: Sequence of Execution
+
+When a trigger (Drawdown, SPX Drop, or Heartbeat loss) is met:
+
+1. **Stop Primary:** Sentinel sends a `POST /v1/accounts/{id}/orders` (Cancel All Open Orders) to Tradier.
+2. **Fetch Positions:** Sentinel calls `GET /v1/accounts/{id}/positions`.
+3. **Order Entry:** Orders are sent in **LIFO (Last-In, First-Out)** order of entry (prioritizing 0DTE legs).
+   - Sentinel uses `POST /v1/accounts/{id}/orders` with `side=sell_to_close` or `buy_to_close`.
+   - **Order Type: `market`** (Profit is secondary to capital preservation during Panic).
+   - **Retry Logic:** If an order fails (API error), retry every 2 seconds for 5 attempts. If it partially fills, fetch remaining quantity and re-submit as a new market order.
+
+### 2.5 Downtime & Alerting
+
+- **Maximum Downtime (X):** 5 Minutes.
+- **Reason:** Beyond 5 minutes, the system is flying without a safety net during 0DTE volatility.
+- **Alert:** If Sentinel logs to GCP Cloud Logging stop for >300s, PagerDuty triggers.
+
+### 2.6 Sandbox Test Protocol
+
+- **The "Tag" Method:** All paper/sandbox trades are given a `tag` field in Tradier (e.g., `MARKETMUSE_PAPER`).
+- **Sentinel Filter:** During paper phase, the Sentinel is configured with a `TEST_MODE=True` flag. It will only execute `close_to_market` on orders containing the `MARKETMUSE_PAPER` tag.
+- **Dry Run:** Every Friday, a "Sentinel Drill" is performed where the primary app is manually killed to ensure the Sentinel detects the heartbeat loss and simulates the closes in logs without sending the API call.
+
+### 2.7 Sentinel Independent Logging
+
+- **Storage:** GCP Cloud Storage (GCS) as JSON files.
+- **Data:** Polled account equity, every heartbeat received, and detailed "Reason for Trigger" if Panic occurs.
+- **Retention:** 90 Days (Legal/Audit requirement).
+
+---
+
+## QUESTION 4 — DATABENTO OPRA INTRADAY GEX INTEGRATION
+
+Moving from static OI to intraday GEX is the "Information Alpha" that separates MarketMuse from retail competitors.
+
+### 4.1 Databento Schema & Fields
+
+We subscribe to the `dbn` (Binary) format for the `opranbus` (OPRA) dataset.
+
+| Field | Required for GEX? | Purpose |
+|---|---|---|
+| ts_recv | Yes | Precise timing for the decay function. |
+| symbol | Yes | Identify Strike, Expiration, and Type (C/P). |
+| price | Yes | Calculate the spot-to-strike distance. |
+| size | Yes | The quantity (the multiplier for GEX). |
+| side | Yes | Critical. Used with the Lee-Ready algorithm to determine Aggressor. |
+| flags | Yes | Filter out late prints or out-of-sequence trades. |
+
+### 4.2 GEX_increment Calculation
+
+The primary challenge is the "Aggressor Ambiguity." We use the **Lee-Ready Algorithm** to classify trades:
+
+- **Rule:** If Trade Price > Midpoint, it is a "Buyer Aggressor" (+1). If Trade Price < Midpoint, it is a "Seller Aggressor" (-1).
+- **Assumption:** A Buyer Aggressor in a Call is assumed to be an "Opening Long" (increasing Dealer Short Gamma).
+- **Formula:** `GEX_increment = Aggressor_Sign * Trade_Size * Option_Gamma * 100`
+
+### 4.3 Computational Efficiency
+
+- **Processing:** We use the Databento Python Client with multiprocessing to handle the ~300k prints.
+- **Bottleneck Fix:** We do **not** recalculate the entire IV surface for every print. We use a **Pre-computed Gamma Look-up Table (LUT)** updated every 60 seconds by the Primary App. The GEX Engine simply maps `Symbol -> LUT_Gamma` and performs a simple addition. This allows processing of 500k prints in <200ms of CPU time.
+
+### 4.4 Fallback & Recovery
+
+- **Detection:** If Databento `keep_alive` is missing for 10 seconds.
+- **Immediate Response (0-30s):** System switches to "Static GEX Mode" (Morning Baseline).
+- **Degraded Mode:** System continues to trade but applies a **50% reduction in position size** due to increased "Signal Uncertainty."
+- **Confidence Decay:** GEX Confidence (C) decays linearly: `C(t) = 1.0 - (minutes_stale / 60)`. At 60 minutes of stale data, C=0 and all 0DTE entries are blocked.
+- **Recovery:** Upon reconnection, the Sentinel requests a **Batch Replay** from Databento for the missed window to "catch up" the GEX_intraday total.
+
+### 4.5 Data Join (The "Bridge")
+
+1. **Pre-Open (08:30 AM):** Fetch CBOE DataShop EOD OI.
+2. **Baseline:** Calculate GEX for every strike using the 08:30 AM Spot price.
+3. **Open (09:30 AM):** Initialize `GEX_intraday = GEX_baseline`.
+4. **Flow:** Start the Databento stream. Every print `p` updates `GEX_intraday += p.increment`.
+5. **First Reading:** Available at 09:31 AM.
+
+### 4.6 Validation Protocol
+
+- **The Ground Truth:** We compare our "Synthetic OI" (Sum of Databento volume) against the next day's actual OI published by the OCC.
+- **Metric:** The **"OI Tracking Error."** If our synthetic OI is within +/- 15% of the official OCC update over the 45-day paper phase, the intraday GEX engine is deemed "Production Ready."
+
+---
+
 *Document maintained by: Gemini 1.5 Pro (Google DeepMind) | Repo: https://github.com/tesfayekb/market-muse.git*
