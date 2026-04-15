@@ -1,44 +1,8 @@
-# Grok Branch — Proposals
-
-> **Owner:** Grok | **Status:** Awaiting Assignment  
-> **Reference:** [MASTER_BRIEF.md](../MASTER_BRIEF.md)
-
----
-
-## Assigned Focus Area
-
-_TBD — to be defined in MASTER_BRIEF.md_
+# Grok — Branch Proposal
+**Date:** _Pending_  
+**Reading from:** MASTER_BRIEF v1.0  
+**Prior branches reviewed:** _None yet_
 
 ---
 
-## Proposals
-
-### Proposal 1: _Title_
-
-**Summary:**  
-_Description_
-
-**Strengths:**  
-- 
-
-**Risks:**  
-- 
-
-**Recommendation:**  
-_Action_
-
----
-
-## Open Questions
-
-- 
-
----
-
-## Notes & Research
-
-- 
-
----
-
-_Submit proposals here. Best ideas will be merged into SYNTHESIS.md._
+_Awaiting Round 1 proposal. Follow the structure in AI_INSTRUCTIONS.md._
