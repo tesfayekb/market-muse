@@ -844,3 +844,1007 @@ broker_constraints.md documents 3-5x wider bid/ask spreads at open. execution_ri
 *Target: SYNTHESIS.md v2.0*  
 *Locked decisions DECISION-001 through DECISION-012 were not re-argued.*  
 *Repo: https://github.com/tesfayekb/market-muse.git*
+
+---
+
+---
+
+# ROUND 3 — Claude (Anthropic) Refinement
+
+**Round:** 3 — Refinement  
+**Questions Assigned:** Q1 (Charm/Vanna Threshold Calibration) + Q5 (Kill-Switch UX)  
+**Date:** 2026-04-15  
+**Reading from:** SYNTHESIS.md v3.0, DECISIONS.md (001–013 all locked), all three constraint files  
+**Repo:** https://github.com/tesfayekb/market-muse.git
+
+---
+
+## QUESTION 1 — CHARM/VANNA THRESHOLD CALIBRATION
+
+### Framing
+
+SYNTHESIS v3.0 established the CV_Stress_Score as a weighted composite of Charm_Velocity and Vanna_Velocity, scaled 0–100, with initial thresholds: WARNING > 60, EXIT > 70, CRITICAL > 80. These are explicitly labeled as unvalidated priors.
+
+The calibration problem is precisely this: **we have a 0–100 signal and three decision thresholds, and we need 45 days of paper data to determine whether those thresholds are set at the right levels for each strategy type — before automated exits start firing on real capital.**
+
+Everything below is designed to answer that question rigorously and produce a validated, deployable threshold set before go-live.
+
+---
+
+### 1.1 EXACT DATA LOGGED FOR EVERY 5-MINUTE CV_STRESS READING
+
+Every 5-minute computation cycle writes one row per open position to TimescaleDB table `cv_stress_readings`. Fields, types, and storage notes follow.
+
+**Table: `cv_stress_readings` (TimescaleDB hypertable, partition by `timestamp_utc`, 1-day chunks)**
+
+```sql
+CREATE TABLE cv_stress_readings (
+  -- Identifiers
+  reading_id          UUID          NOT NULL DEFAULT gen_random_uuid(),
+  session_date        DATE          NOT NULL,
+  timestamp_utc       TIMESTAMPTZ   NOT NULL,
+  position_id         TEXT          NOT NULL,   -- e.g. "SPX_IC_20260415_001"
+  instrument          TEXT          NOT NULL,   -- 'SPX' | 'NDX' | 'RUT'
+  strategy_type       TEXT          NOT NULL,   -- 'iron_condor' | 'credit_spread' | 'debit_vertical'
+  position_tier       TEXT          NOT NULL,   -- 'core' | 'satellite'
+
+  -- Raw second-order Greeks (portfolio-level for this position)
+  -- Units: charm = delta/day; vanna = delta/vol_point (1 vol point = 1% abs IV)
+  charm_portfolio     DOUBLE PRECISION  NOT NULL,
+  vanna_portfolio     DOUBLE PRECISION  NOT NULL,
+
+  -- Velocity measures: rate of change per minute over the preceding 5-minute interval
+  -- charm_velocity = (charm_t - charm_{t-5min}) / 5.0
+  charm_velocity      DOUBLE PRECISION  NOT NULL,
+  vanna_velocity      DOUBLE PRECISION  NOT NULL,
+
+  -- Rolling normalization context (20-session rolling std, computed pre-session)
+  -- Required to reconstruct Z-scores consistently during calibration analysis
+  charm_velocity_std  DOUBLE PRECISION  NOT NULL,
+  vanna_velocity_std  DOUBLE PRECISION  NOT NULL,
+
+  -- Z-score components (charm_velocity / charm_velocity_std, floored at 0 for stress)
+  charm_z             DOUBLE PRECISION  NOT NULL,
+  vanna_z             DOUBLE PRECISION  NOT NULL,
+
+  -- Active weight configuration at time of reading (these change during calibration)
+  charm_weight        DOUBLE PRECISION  NOT NULL DEFAULT 0.5,
+  vanna_weight        DOUBLE PRECISION  NOT NULL DEFAULT 0.5,
+
+  -- Final computed score
+  cv_stress_score     DOUBLE PRECISION  NOT NULL,  -- 0.0 to 100.0
+
+  -- Position P&L context (needed for outcome labeling)
+  position_pnl_usd    DOUBLE PRECISION  NOT NULL,   -- unrealized P&L in USD
+  position_max_profit DOUBLE PRECISION  NOT NULL,   -- max possible profit for position
+  position_profit_pct DOUBLE PRECISION  NOT NULL,   -- pnl / max_profit, range [-inf, 1.0]
+  entry_credit_usd    DOUBLE PRECISION  NOT NULL,   -- original credit received in USD
+  contracts           SMALLINT          NOT NULL,
+
+  -- Market context at reading time
+  spx_price           DOUBLE PRECISION  NOT NULL,
+  vix_level           DOUBLE PRECISION  NOT NULL,
+  vvix_level          DOUBLE PRECISION  NOT NULL,
+  iv_change_5min      DOUBLE PRECISION  NOT NULL,   -- absolute IV change: e.g. +0.02 = +2 vol points
+  regime              TEXT              NOT NULL,   -- HMM state: 'pin_range', 'quiet_bullish', etc.
+  rcs                 DOUBLE PRECISION  NOT NULL,   -- Regime Confidence Score 0–100
+  time_to_230pm_min   DOUBLE PRECISION  NOT NULL,   -- minutes remaining until 2:30 PM hard stop
+
+  -- GEX context
+  gex_net             DOUBLE PRECISION  NOT NULL,   -- net portfolio GEX in $MM/% SPX move
+  gex_nearest_wall_pct DOUBLE PRECISION NOT NULL,  -- distance to nearest GEX wall as % of spot
+
+  -- Threshold state at reading time (BEFORE any action)
+  threshold_breached  BOOLEAN           NOT NULL DEFAULT FALSE,
+  threshold_level     TEXT              NULL,         -- 'WARNING' | 'EXIT' | 'CRITICAL' | NULL
+  exit_automated      BOOLEAN           NOT NULL DEFAULT FALSE,  -- did this reading trigger automated exit?
+  exit_pct            DOUBLE PRECISION  NULL,         -- what % of position was exited (0.5, 1.0, or NULL)
+
+  -- Forward outcomes — NULL at write time, populated by EOD job
+  -- "Forward window" is defined as: min(20 minutes, time until 2:30 PM stop)
+  pnl_10min_forward   DOUBLE PRECISION  NULL,
+  pnl_20min_forward   DOUBLE PRECISION  NULL,
+  session_final_pnl   DOUBLE PRECISION  NULL,   -- position P&L at session close (or stop)
+  outcome_label       TEXT              NULL,   -- 'LOSS' | 'NEUTRAL' | 'GAIN' — see Section 1.2
+
+  PRIMARY KEY (reading_id, timestamp_utc)
+);
+
+SELECT create_hypertable('cv_stress_readings', 'timestamp_utc');
+CREATE INDEX ON cv_stress_readings (position_id, timestamp_utc DESC);
+CREATE INDEX ON cv_stress_readings (strategy_type, session_date);
+CREATE INDEX ON cv_stress_readings (cv_stress_score, timestamp_utc DESC);
+```
+
+**EOD population job (runs at 4:30 PM EST after paper session):**
+
+```python
+def populate_forward_outcomes(session_date: date) -> None:
+    """
+    Runs EOD. Fills in pnl_10min_forward, pnl_20min_forward,
+    session_final_pnl, and outcome_label for all readings from today.
+    Uses TimescaleDB to join readings with the position P&L time-series.
+    """
+    query = """
+    UPDATE cv_stress_readings r
+    SET
+        pnl_10min_forward = (
+            SELECT pnl FROM position_pnl_ts p
+            WHERE p.position_id = r.position_id
+              AND p.timestamp_utc >= r.timestamp_utc + interval '10 minutes'
+            ORDER BY p.timestamp_utc ASC LIMIT 1
+        ),
+        pnl_20min_forward = (
+            SELECT pnl FROM position_pnl_ts p
+            WHERE p.position_id = r.position_id
+              AND p.timestamp_utc >= r.timestamp_utc + interval '20 minutes'
+            ORDER BY p.timestamp_utc ASC LIMIT 1
+        ),
+        session_final_pnl = (
+            SELECT pnl FROM position_pnl_ts p
+            WHERE p.position_id = r.position_id
+            ORDER BY p.timestamp_utc DESC LIMIT 1
+        )
+    WHERE r.session_date = %s AND r.pnl_20min_forward IS NULL;
+    """
+    # outcome_label assignment happens in separate pass after all forward P&L is set
+    label_query = """
+    UPDATE cv_stress_readings
+    SET outcome_label = CASE
+        WHEN pnl_20min_forward < -0.25 * GREATEST(position_max_profit - position_pnl_usd, 0.01)
+             THEN 'LOSS'
+        WHEN pnl_20min_forward > 0.15 * GREATEST(position_max_profit - position_pnl_usd, 0.01)
+             THEN 'GAIN'
+        ELSE 'NEUTRAL'
+    END
+    WHERE session_date = %s AND outcome_label IS NULL;
+    """
+```
+
+---
+
+### 1.2 CALIBRATION METRIC
+
+**The calibration objective is a cost-weighted threshold optimization, not accuracy.**
+
+Simple accuracy is wrong here because outcomes are asymmetric: exiting a profitable position early (false positive) costs foregone theta. Failing to exit before a loss (false negative) costs the full loss from the current P&L level. These costs are not equal — false negatives are structurally more expensive for 0DTE short-gamma positions.
+
+**Outcome label definition:**
+
+Given a CV_Stress reading at time `t` with `pnl_20min_forward` populated:
+
+```
+profit_remaining = max(position_max_profit - position_pnl_usd, 0.01)
+
+LOSS:    pnl_20min_forward < -0.25 × profit_remaining
+         (position lost 25%+ of remaining profit potential in 20 minutes)
+
+NEUTRAL: abs(pnl_20min_forward) ≤ 0.15 × profit_remaining
+
+GAIN:    pnl_20min_forward > 0.15 × profit_remaining
+```
+
+Neutral observations are excluded from precision/recall calculations. They are noise — the position moved neither meaningfully toward profit nor toward loss. Using them as "false positives" would artificially inflate FP rates.
+
+**Primary calibration metric — Cost-Weighted Error Rate (CWER):**
+
+```
+CWER(threshold) = FP_COST × FP_rate + FN_COST × FN_rate
+
+Where:
+FP_rate = (exits triggered when outcome was GAIN) / (total exits triggered)
+FN_rate = (non-exits when outcome was LOSS) / (total LOSS events)
+
+FP_COST = 1.0  (exits that weren't needed — foregone profit)
+FN_COST = 3.0  (missed exits that preceded losses — the expensive mistake)
+```
+
+The 3:1 FN:FP cost ratio reflects that on a 0DTE iron condor at 65% of max profit with a CV_Stress miss, the subsequent loss frequently exceeds the profit already captured. The 3:1 ratio is an initial prior; it should be recalibrated during paper phase using actual dollar outcomes (compare dollar of foregone profit on FPs vs dollar of additional loss on FNs).
+
+**Secondary metric — Positive Predictive Value (PPV) at the EXIT threshold:**
+
+```
+PPV = TP / (TP + FP) = fraction of triggered exits that preceded an actual LOSS
+```
+
+PPV must be ≥ 0.55 at the EXIT threshold (> 70 initial). If PPV < 0.55, the EXIT threshold is too sensitive and is generating more noise than signal.
+
+---
+
+### 1.3 ACCEPTABLE FALSE POSITIVE RATE
+
+**Target: FP_rate ≤ 0.20 at the EXIT threshold (CV_Stress > calibrated EXIT value).**
+
+This means: of every 10 automated partial exits triggered by CV_Stress, at most 2 should occur when the position would have continued profitably. The other 8 should have been exits that correctly avoided subsequent deterioration.
+
+**Rationale for 20%:** The EXIT threshold triggers a 50% automated exit (State 3 → State 4 per SYNTHESIS v3.0). A false positive here does not close the position — it reduces size and trails the remainder. The cost of a false positive is foregone theta on the closed half, typically $30–100 on a standard SPX credit spread. A 20% FP rate with average FP cost of $65 = ~$13 expected cost per EXIT trigger. Against the FN cost (position continues to loss, often $200–600 additional damage avoided), this is acceptable.
+
+If FP_rate > 25% after calibration, the EXIT threshold is too sensitive. Raise it by 5 points.  
+If FP_rate < 10% after calibration, the threshold may be too loose (leaving FN risk high). Inspect FN_rate.
+
+---
+
+### 1.4 ACCEPTABLE FALSE NEGATIVE RATE
+
+**Target: FN_rate ≤ 0.15 at the EXIT threshold.**
+
+This means: of every 10 positions that subsequently deteriorated significantly in the 20-minute forward window, at most 1.5 should have had CV_Stress scores that did NOT trigger the EXIT threshold.
+
+**Rationale for 15%:** The FN scenario is the expensive one — the position continued toward max loss when CV_Stress should have triggered an exit. At a 15% FN rate, 1–2 FN events per 10 LOSS events will occur. Given approximately 2–4 significant position losses per month in paper phase, this means 0–1 FN events per month are acceptable. At 0 FN events per month, the threshold is likely too sensitive (FP rate will be high). At 2+ FN events per month, the threshold needs tightening.
+
+**Hard floor regardless of calibration:** FN_rate must not exceed 0.25. If any calibrated threshold produces FN_rate > 0.25, do not go live on that strategy type until more paper data is collected. A system that misses 1-in-4 deteriorating positions has not validated this signal.
+
+---
+
+### 1.5 WEEKLY THRESHOLD RECALIBRATION FUNCTION
+
+Runs every Sunday evening during the 45-day paper phase (approximately 6 runs total). Produces updated threshold recommendations that must be reviewed by the operator before taking effect. Auto-applies only if the new thresholds produce ≥ 10% CWER improvement over current.
+
+```python
+from __future__ import annotations
+import math
+import numpy as np
+import pandas as pd
+from dataclasses import dataclass, field
+from typing import Optional
+from sqlalchemy import text
+from app.db import get_timescale_connection
+
+# ── Configuration ────────────────────────────────────────────────────────────
+
+FP_COST   = 1.0   # cost per false positive exit (unit: normalized)
+FN_COST   = 3.0   # cost per false negative miss
+MIN_ROWS  = 15    # minimum observations before calibration is meaningful
+MIN_LOSS_EVENTS = 8  # minimum LOSS-labeled rows before thresholds are trusted
+
+THRESHOLD_CANDIDATES = list(range(40, 96, 5))  # [40, 45, 50, ..., 95]
+STRATEGY_TYPES = ['iron_condor', 'credit_spread', 'debit_vertical']
+
+# ── Data classes ─────────────────────────────────────────────────────────────
+
+@dataclass
+class CalibrationResult:
+    strategy_type: str
+    status: str                        # 'CALIBRATED' | 'INSUFFICIENT_DATA' | 'UNCHANGED'
+    current_thresholds: dict[str, float]
+    recommended_thresholds: dict[str, float]
+    improvement_pct: float             # CWER improvement if recommended applied
+    auto_apply: bool                   # True if improvement ≥ 10% AND min data met
+    n_observations: int
+    n_loss_events: int
+    n_trigger_events_at_exit: int
+    fp_rate_at_exit: float
+    fn_rate_at_exit: float
+    ppv_at_exit: float
+    cwer_current: float
+    cwer_recommended: float
+    meets_fp_budget: bool              # fp_rate ≤ 0.20
+    meets_fn_budget: bool              # fn_rate ≤ 0.15
+    meets_fn_hard_floor: bool          # fn_rate ≤ 0.25 — if False, block go-live
+    calibration_grid: list[dict]       # full grid for audit log
+
+
+# ── Core calibration logic ────────────────────────────────────────────────────
+
+def _compute_rates(
+    df: pd.DataFrame,
+    threshold: float
+) -> dict[str, float]:
+    """Compute FP rate, FN rate, PPV at a given threshold."""
+    triggered   = df['cv_stress_score'] > threshold
+    is_loss     = df['outcome_label'] == 'LOSS'
+    is_gain     = df['outcome_label'] == 'GAIN'
+    # Exclude NEUTRAL from FP/FN denominators
+    df_nonneutral = df[df['outcome_label'] != 'NEUTRAL']
+    triggered_nn  = df_nonneutral['cv_stress_score'] > threshold
+    is_loss_nn    = df_nonneutral['outcome_label'] == 'LOSS'
+    is_gain_nn    = df_nonneutral['outcome_label'] == 'GAIN'
+
+    TP = int((triggered_nn &  is_loss_nn).sum())
+    FP = int((triggered_nn & ~is_loss_nn).sum())  # triggered but was GAIN
+    FN = int((~triggered_nn & is_loss_nn).sum())  # not triggered but was LOSS
+    TN = int((~triggered_nn & ~is_loss_nn).sum())
+
+    n_triggered = TP + FP
+    n_loss      = TP + FN
+
+    fp_rate = FP / n_triggered if n_triggered > 0 else 1.0
+    fn_rate = FN / n_loss      if n_loss > 0      else 0.0
+    ppv     = TP / n_triggered if n_triggered > 0 else 0.0
+    cwer    = FP_COST * fp_rate + FN_COST * fn_rate
+
+    return {
+        'threshold': threshold,
+        'TP': TP, 'FP': FP, 'FN': FN, 'TN': TN,
+        'fp_rate': round(fp_rate, 4),
+        'fn_rate': round(fn_rate, 4),
+        'ppv':     round(ppv,     4),
+        'cwer':    round(cwer,    4),
+        'n_triggered': n_triggered,
+        'n_loss':      n_loss,
+    }
+
+
+def calibrate_cv_thresholds(
+    strategy_type: str,
+    current_thresholds: dict[str, float],
+    paper_session_count: int,
+    fp_budget:  float = 0.20,
+    fn_budget:  float = 0.15,
+    fn_hard_floor: float = 0.25,
+    auto_apply_cwer_improvement: float = 0.10,  # 10% CWER improvement required for auto-apply
+) -> CalibrationResult:
+    """
+    Weekly CV_Stress threshold recalibration for a single strategy type.
+
+    Queries cv_stress_readings from TimescaleDB.
+    Returns CalibrationResult with recommended thresholds and quality metrics.
+    Calling code must write the result to the audit log and conditionally apply.
+
+    Special handling for 'debit_vertical': stress interpretation is inverted —
+    high CV_Stress can indicate FAVORABLE conditions for long-gamma positions.
+    Separate calibration logic applied (see Section 1.7).
+    """
+    if strategy_type == 'debit_vertical':
+        return _calibrate_debit_vertical(current_thresholds, paper_session_count)
+
+    # ── Fetch data ────────────────────────────────────────────────────────────
+    with get_timescale_connection() as conn:
+        df = pd.read_sql(text("""
+            SELECT
+                cv_stress_score,
+                outcome_label,
+                position_pnl_usd,
+                position_max_profit,
+                position_profit_pct,
+                time_to_230pm_min,
+                regime,
+                charm_velocity,
+                vanna_velocity,
+                iv_change_5min
+            FROM cv_stress_readings
+            WHERE strategy_type = :stype
+              AND outcome_label IS NOT NULL
+              AND pnl_20min_forward IS NOT NULL
+              -- Exclude final 10 minutes before 2:30 PM stop —
+              -- exits at that window are time-forced, not CV signal exits
+              AND time_to_230pm_min > 10.0
+        """), conn, params={'stype': strategy_type})
+
+    n_obs   = len(df)
+    n_loss  = int((df['outcome_label'] == 'LOSS').sum()) if n_obs > 0 else 0
+
+    # ── Insufficient data guard ───────────────────────────────────────────────
+    if n_obs < MIN_ROWS or n_loss < MIN_LOSS_EVENTS:
+        return CalibrationResult(
+            strategy_type=strategy_type,
+            status='INSUFFICIENT_DATA',
+            current_thresholds=current_thresholds,
+            recommended_thresholds=current_thresholds,  # unchanged
+            improvement_pct=0.0,
+            auto_apply=False,
+            n_observations=n_obs,
+            n_loss_events=n_loss,
+            n_trigger_events_at_exit=0,
+            fp_rate_at_exit=float('nan'),
+            fn_rate_at_exit=float('nan'),
+            ppv_at_exit=float('nan'),
+            cwer_current=float('nan'),
+            cwer_recommended=float('nan'),
+            meets_fp_budget=False,
+            meets_fn_budget=False,
+            meets_fn_hard_floor=False,
+            calibration_grid=[],
+        )
+
+    # ── Grid search ───────────────────────────────────────────────────────────
+    grid = [_compute_rates(df, t) for t in THRESHOLD_CANDIDATES]
+    current_exit = current_thresholds['exit']
+    current_rates = _compute_rates(df, current_exit)
+    cwer_current = current_rates['cwer']
+
+    # Candidate selection: minimize CWER subject to:
+    #   1. fp_rate  ≤ fp_budget    (hard constraint)
+    #   2. fn_rate  ≤ fn_hard_floor (hard constraint — if violated, flag for go-live block)
+    #   3. PPV      ≥ 0.55
+    #   4. n_triggered ≥ 5         (threshold must be relevant — must fire at least occasionally)
+    eligible = [
+        r for r in grid
+        if r['fp_rate']    <= fp_budget
+        and r['fn_rate']   <= fn_hard_floor
+        and r['ppv']       >= 0.55
+        and r['n_triggered'] >= 5
+    ]
+
+    if not eligible:
+        # No eligible threshold found — keep current thresholds
+        best_exit = current_exit
+        best_rates = current_rates
+    else:
+        best_grid_row = min(eligible, key=lambda r: r['cwer'])
+        best_exit  = best_grid_row['threshold']
+        best_rates = best_grid_row
+
+    cwer_recommended = best_rates['cwer']
+    improvement_pct  = (cwer_current - cwer_recommended) / cwer_current if cwer_current > 0 else 0.0
+
+    # WARNING threshold = exit - 10 (bounded 35–exit-5)
+    # CRITICAL threshold = exit + 10 (bounded exit+5–95)
+    new_warning  = max(35.0,  best_exit - 10.0)
+    new_critical = min(95.0,  best_exit + 10.0)
+
+    recommended = {
+        'warning':  new_warning,
+        'exit':     best_exit,
+        'critical': new_critical,
+    }
+
+    meets_fp  = best_rates['fp_rate'] <= fp_budget
+    meets_fn  = best_rates['fn_rate'] <= fn_budget
+    meets_floor = best_rates['fn_rate'] <= fn_hard_floor
+
+    auto_apply = (
+        improvement_pct >= auto_apply_cwer_improvement
+        and n_obs   >= MIN_ROWS
+        and n_loss  >= MIN_LOSS_EVENTS
+        and meets_fp
+        and meets_floor
+        and recommended != current_thresholds  # only apply if something actually changed
+    )
+
+    return CalibrationResult(
+        strategy_type=strategy_type,
+        status='CALIBRATED' if eligible else 'UNCHANGED',
+        current_thresholds=current_thresholds,
+        recommended_thresholds=recommended,
+        improvement_pct=round(improvement_pct, 4),
+        auto_apply=auto_apply,
+        n_observations=n_obs,
+        n_loss_events=n_loss,
+        n_trigger_events_at_exit=best_rates['n_triggered'],
+        fp_rate_at_exit=best_rates['fp_rate'],
+        fn_rate_at_exit=best_rates['fn_rate'],
+        ppv_at_exit=best_rates['ppv'],
+        cwer_current=round(cwer_current, 4),
+        cwer_recommended=round(cwer_recommended, 4),
+        meets_fp_budget=meets_fp,
+        meets_fn_budget=meets_fn,
+        meets_fn_hard_floor=meets_floor,
+        calibration_grid=grid,
+    )
+
+
+def run_weekly_calibration(
+    current_threshold_config: dict[str, dict[str, float]]
+) -> dict[str, CalibrationResult]:
+    """
+    Entry point. Runs calibration for all 3 strategy types.
+    Called by APScheduler job every Sunday at 6:00 PM EST.
+
+    current_threshold_config format:
+    {
+        'iron_condor':    {'warning': 60, 'exit': 70, 'critical': 80},
+        'credit_spread':  {'warning': 60, 'exit': 70, 'critical': 80},
+        'debit_vertical': {'warning': 65, 'exit': 75, 'critical': 85},
+    }
+
+    Returns dict of CalibrationResult per strategy type.
+    Caller must write all results to cv_calibration_log table.
+    Caller must check auto_apply flag before writing new thresholds to config.
+    """
+    paper_session_count = _count_completed_paper_sessions()
+    results = {}
+    for stype in STRATEGY_TYPES:
+        results[stype] = calibrate_cv_thresholds(
+            strategy_type=stype,
+            current_thresholds=current_threshold_config[stype],
+            paper_session_count=paper_session_count,
+        )
+    return results
+```
+
+---
+
+### 1.6 MINIMUM CV_STRESS TRIGGER EVENTS BEFORE THRESHOLD IS CONSIDERED CALIBRATED
+
+The threshold is considered **statistically calibrated** when ALL of the following are met:
+
+| Requirement | Minimum Count | Reasoning |
+|---|---|---|
+| Total observations (all outcome labels) | ≥ 100 per strategy type | Sufficient density for FP/FN rate estimates with ±10% confidence |
+| LOSS-labeled observations | ≥ 20 per strategy type | 20 LOSS events give ~80% power to detect a 15% FN rate difference at p=0.05 |
+| Trigger events at EXIT threshold | ≥ 15 per strategy type | Below 15, PPV estimate has ±25% confidence interval — too wide to act on |
+| GAIN-labeled observations | ≥ 15 per strategy type | Required to estimate FP rate |
+| Sessions covered | ≥ 20 paper sessions | Ensures data spans multiple regime types |
+
+If any of these minimums are not met by Day 30 of paper trading, flag in the go-live report. The exit-trigger calibration for the flagged strategy type is classified as "not validated." Live trading on that strategy type begins at 25% of normal sizing (same as under-validated day types per DECISION-013) until minimums are met in live paper-equivalent data.
+
+**Practical note on achieving minimums during 45 days:**
+
+The system should deliberately vary effective thresholds during paper phase to generate more trigger events for calibration logging. This is done by logging hypothetical trigger events at ALL threshold levels (40, 45, 50, ... 95) for every reading, regardless of the active threshold. This creates a richer calibration dataset without changing the system's actual exit behavior during paper phase. Implementation:
+
+```python
+# In the 5-minute CV_Stress computation cycle (paper phase only):
+# Always log the reading at ALL threshold levels for calibration purposes.
+# Active threshold triggers are still governed by current_thresholds.
+# This "shadow logging" populates the calibration grid with observations
+# across the entire threshold range — not just where the active threshold fires.
+PAPER_PHASE_SHADOW_THRESHOLDS = list(range(40, 96, 5))
+```
+
+---
+
+### 1.7 CALIBRATION DIFFERENCES PER STRATEGY TYPE
+
+**Iron Condor (both sides short gamma):**
+
+CV_Stress is computed independently for each wing (call-side charm/vanna and put-side charm/vanna). The EXIT threshold fires if EITHER wing's CV_Stress exceeds the threshold — not just the portfolio composite.
+
+```python
+# Iron condor: compute wing-specific stress
+cv_stress_call_wing = compute_wing_cv_stress(call_short_strike, call_long_strike, ...)
+cv_stress_put_wing  = compute_wing_cv_stress(put_short_strike, put_long_strike, ...)
+cv_stress_ic        = max(cv_stress_call_wing, cv_stress_put_wing)
+```
+
+The calibration dataset for iron condors uses `cv_stress_ic` (the max of both wings) as the predictor variable. This means a high-stress reading on one wing drives the composite, which is correct — either wing blowing out is an IC loss.
+
+Expected calibrated threshold: slightly HIGHER than credit spreads (55–75 range), because an iron condor at moderate CV_Stress on one wing may still be self-hedging via the opposite wing reducing portfolio delta. The single wing losing while the other wing profits is a partial-loss scenario that may not warrant full 50% exit.
+
+**Credit Spread (single-sided short gamma):**
+
+Standard calibration as described in 1.5. No wing differentiation. The CV_Stress directly measures the deterioration of the single short position.
+
+Expected calibrated threshold: the most sensitive of the three (potentially 60–70 range), because there is no offsetting long-gamma wing. All adverse charm/vanna pressure concentrates on one side.
+
+**Debit Vertical (long gamma):**
+
+This strategy has the OPPOSITE relationship with charm and vanna. For a debit call spread:
+- Rising vanna (with rising vol) increases position delta FAVORABLY
+- Charm for a long delta position moving toward the short strike is not necessarily harmful — it's the natural theta cost of a long option
+
+For debit verticals, CV_Stress is NOT a protective exit signal. It is a momentum confirmation signal. A rising CV_Stress on a debit vertical often means the trade is working (vol expanding, delta accelerating toward the target).
+
+**For debit verticals, the CV_Stress thresholds apply INVERSELY:**
+
+```python
+def _calibrate_debit_vertical(
+    current_thresholds: dict[str, float],
+    paper_session_count: int
+) -> CalibrationResult:
+    """
+    Debit verticals: CV_Stress is a momentum confirmation signal, not an exit signal.
+    
+    For debit verticals in SYNTHESIS v3.0, CV_Stress > threshold triggers:
+    - HOLD (don't exit early) rather than EXIT
+    - Target: CV_Stress > 60 means "thesis is being confirmed, hold remainder"
+    
+    Calibration here evaluates: does high CV_Stress correctly predict that
+    the position will CONTINUE to profit (not that it will lose)?
+    """
+    # For debit verticals: swap FP/FN definitions
+    # "False Positive" = CV_Stress high, but position did NOT continue gaining
+    # "False Negative" = CV_Stress low, but position DID continue gaining
+    # We want to optimize: high CV_Stress correctly predicts continued gains
+    ...
+```
+
+The debit vertical calibration runs independently and has a separate threshold config key (`debit_vertical_momentum_threshold`). It does not share thresholds with the short-gamma strategies.
+
+---
+
+### 1.8 GO-LIVE GATE FOR CV_STRESS CALIBRATION
+
+Before live capital is deployed, the CV_Stress calibration report must show:
+
+| Check | Requirement |
+|---|---|
+| Iron condor EXIT threshold calibrated | ≥ 15 trigger events, PPV ≥ 0.55, FP_rate ≤ 0.20, FN_rate ≤ 0.25 |
+| Credit spread EXIT threshold calibrated | Same |
+| FP cost estimate vs FN cost estimate | Operator must review the 3:1 FN:FP cost ratio is appropriate given actual dollar P&L data |
+| No calibration run shows fn_rate > 0.25 | If any weekly calibration produces FN_rate > 0.25, go-live on that strategy is blocked |
+
+If calibration passes, SYNTHESIS v3.0's initial thresholds (60/70/80) are replaced with the calibrated values in the live config before Day 1 of live trading.
+
+---
+
+## QUESTION 5 — KILL-SWITCH USER EXPERIENCE
+
+### Framing
+
+The system is fully automated. No trades require human approval. The operator's only real-time intervention mechanism is the kill-switch — a mobile action that closes ALL positions in under 5 seconds from anywhere in the world.
+
+This means the kill-switch must be:
+1. **Always accessible** — works on degraded mobile networks
+2. **Deliberate** — impossible to trigger accidentally
+3. **Instantaneous** — the 5-second requirement is a hard performance target, not a guideline
+4. **Redundant** — fires via both Primary (AWS) and Sentinel (GCP) simultaneously
+5. **Confirmatory** — operator sees exactly what happened within 10 seconds of activation
+
+The architecture below achieves all five.
+
+---
+
+### 5.1 WHAT THE OPERATOR SEES DURING NORMAL OPERATION
+
+The kill-switch interface is a **Progressive Web App (PWA)** — a mobile-responsive React app using the existing Tailwind stack, installable to phone home screen for one-tap access. No App Store distribution. No native app build pipeline. Deployed as a sub-route of the existing FastAPI/React application at `/mobile`.
+
+**Normal operation screen — single scrollable page, updates every 5 seconds:**
+
+```
+┌─────────────────────────────────────────────────┐
+│  MarketMuse  ●  LIVE            [10:47:23 EST]  │
+│                                                 │
+│  TODAY'S P&L                                    │
+│  ┌───────────────────────────────────────────┐  │
+│  │  +$486  ▲                   Day: +0.49%   │  │
+│  │  Drawdown used: 0.49% of 3.0% limit       │  │
+│  │  ████░░░░░░░░░░░░░░░░░░░░░░░░░ 16%        │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  OPEN POSITIONS  (2)                            │
+│  ┌───────────────────────────────────────────┐  │
+│  │  ● SPX IC  5440/5430 5520/5530            │  │
+│  │    P&L: +$210  │ CV: 22  │ TP: 7%        │  │
+│  │    Delta: 0.03  │ Status: HEALTHY         │  │
+│  │                                           │  │
+│  │  ● SPX CS  5460/5450 (PUT)                │  │
+│  │    P&L: +$276  │ CV: 18  │ TP: 5%        │  │
+│  │    Delta: -0.05 │ Status: HEALTHY         │  │
+│  └───────────────────────────────────────────┘  │
+│                                                 │
+│  SYSTEM STATUS                                  │
+│  Primary  ●  Sentinel  ●  Feeds  ●             │
+│  Regime: PIN/RANGE (RCS: 74)                   │
+│  VVIX: 95.4  VIX: 15.2                         │
+│                                                 │
+│  ┌───────────────────────────────────────────┐  │
+│  │                                           │  │
+│  │         ████  KILL ALL  ████              │  │
+│  │        (Hold 1.5 seconds to activate)     │  │
+│  │                                           │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
+```
+
+**Data shown, update frequency, and data source:**
+
+| Field | Update Frequency | Source |
+|---|---|---|
+| Today's P&L ($) | Every 5 seconds | Tradier streaming WebSocket (via FastAPI proxy) |
+| Drawdown bar (% of -3% limit) | Every 5 seconds | Calculated locally from P&L |
+| Per-position P&L | Every 5 seconds | Tradier position stream |
+| CV Stress Score | Every 5 minutes | Primary app Redis cache (polling fallback if WS down) |
+| Touch Probability (TP) | Every 5 minutes | Primary app Redis cache |
+| Delta per position | Every 30 seconds | Primary app Greeks aggregate |
+| System Status indicators | Every 10 seconds | Sentinel heartbeat + primary heartbeat |
+| Regime / VVIX / VIX | Every 60 seconds | Primary app Redis cache |
+
+**Alert badge**: a colored dot on the app icon (home screen) and the top bar:
+- 🟢 Green: All systems healthy, no alerts
+- 🟡 Yellow: WARNING level active
+- 🔴 Red: CRITICAL or EMERGENCY
+- ⚫ Black: SENTINEL tier — primary app potentially down
+
+Push notifications (Firebase Cloud Messaging) fire for WARNING and above. SMS (Twilio) fires for CRITICAL and above. The operator does NOT need to have the app open to receive critical alerts.
+
+---
+
+### 5.2 KILL-SWITCH NOTIFICATION TRIGGERS — PRIORITY ORDER
+
+The following conditions cause a push notification with a "REVIEW → KILL" action button. Priority order determines which alert supersedes others on the lock screen.
+
+| Priority | Condition | Channel | Automated Response (if operator doesn't act) |
+|---|---|---|---|
+| P1 | EMERGENCY drawdown ≥ −3% | Push + SMS + Email | Sentinel auto-closes ALL at drawdown hit |
+| P2 | VVIX > 140 OR VVIX +25% in 30 min | Push + SMS | Primary app auto-closes short-gamma |
+| P3 | SPX drops > 2.5% in 30 min | Push + SMS | Sentinel auto-closes ALL |
+| P4 | Primary app heartbeat lost > 90 seconds | SMS (push unreliable if app is down) | Sentinel auto-closes at 120 seconds |
+| P5 | CRITICAL drawdown ≥ −2% | Push + SMS | Primary app halts new entries |
+| P6 | WebSocket degraded > 20 seconds | Push | Primary app halts new entries, REST fallback |
+| P7 | CV_Stress > 80 on any position | Push | 50% auto-exit already executing |
+| P8 | Sentinel unreachable > 60 seconds | Push | WARNING only — no auto-action |
+
+Note: P1–P4 trigger automated system responses independently of the kill-switch. The push notification is an awareness mechanism so the operator knows what happened. The kill-switch is for scenarios NOT covered by automated responses — e.g., the operator observes abnormal behavior, sees news that changes the trade thesis, or decides to halt for any reason.
+
+---
+
+### 5.3 EXACT KILL SEQUENCE — FROM TAP TO ALL POSITIONS CLOSED
+
+**Design choice: HOLD-TO-KILL (1.5-second press)**
+
+A single tap cannot activate the kill. The operator must hold the red button for 1.5 continuous seconds. A progress ring fills around the button during the hold. Releasing early cancels. This prevents accidental activation while adding only 1.5 seconds to the total time — keeping the total well under 5 seconds.
+
+During the hold: the app pre-connects to both Primary and Sentinel endpoints (warm TCP connection), validates the operator's session token, and pre-constructs the kill request payload. At the 1.5-second mark, the kill fires instantly without additional network setup.
+
+**Step-by-step sequence with latency targets:**
+
+```
+t = 0ms       Operator begins holding KILL button
+              App starts progress ring animation (visual feedback)
+              App begins TCP connection pre-warm to Primary + Sentinel (background)
+
+t = 500ms     Haptic feedback pulse #1 ("you're holding correctly")
+              App completes TCP pre-warm (connections live and waiting)
+
+t = 1500ms    Operator has held full 1.5 seconds
+              Haptic feedback pulse #2 ("kill is firing")
+              Screen transitions to "KILL EXECUTING" view
+
+t = 1510ms    [TARGET: ≤ 10ms after threshold]
+              App dispatches two parallel HTTPS POST requests simultaneously:
+              POST https://primary.marketmuse.io/emergency/kill
+              POST https://sentinel.marketmuse.io/emergency/kill
+              Both requests include: {session_token, timestamp_utc, operator_id, reason: "MANUAL"}
+              Both requests use HTTP/2 keep-alive on pre-warmed connections
+
+t = 1510ms    ALSO: App calls navigator.sendBeacon() as a fire-and-forget backup
+              to /emergency/kill (survives browser/app backgrounding)
+
+t = 1600ms    [TARGET: ≤ 100ms after dispatch — network transit]
+              Primary FastAPI receives kill request
+              Validates session token (< 5ms — JWT verification, no DB call)
+              Sets Redis key: kill_switch:active = 1 (TTL 300 seconds)
+              All trading loops poll this key every 100ms — they halt immediately
+
+t = 1650ms    Primary FastAPI constructs close orders for all open positions
+              For each position: multi-leg close at AGGRESSIVE LIMIT
+              (bid price for sells, ask price for buys — guarantees fill, accepts full spread)
+              Order construction: < 50ms
+
+t = 1700ms    [TARGET: ≤ 100ms after primary receives]
+              Primary submits close orders to Tradier REST API
+              Uses dedicated "kill channel" API token (separate from normal trading token)
+              Kill channel reserved for emergency use — never rate-limited by normal operations
+              HTTP/2 connection pre-warmed to api.tradier.com at session start
+
+t = 1900ms    [TARGET: ≤ 200ms Tradier processing]
+              Tradier confirms order receipt (not fill — confirmation of submission)
+              Primary sends status update to mobile app via Server-Sent Events (SSE):
+              {"position_1": "submitted", "position_2": "submitted"}
+
+t = 2000ms    [Sentinel processing — parallel to above]
+              Sentinel on GCP also received the kill request at t ≈ 1620ms
+              Sentinel independently polls Tradier positions (it does so every 10s already)
+              Sentinel submits its own close-all order as redundant backup
+              (Tradier handles duplicate close orders gracefully — second order sees no open position)
+
+t = 2200ms    [Fill confirmations begin]
+              Aggressive limit orders at bid/ask fill within 200-800ms on SPX options
+              (spread takers at bid/ask are immediately matched)
+              Tradier fill confirmations arrive:
+              Primary receives fill confirmations, updates position state to FLAT
+              Mobile app SSE receives: {"position_1": "confirmed", "position_2": "confirmed"}
+
+t = 2500ms    [TARGET: all positions confirmed flat]
+              Mobile app shows KILL COMPLETE screen (see Section 5.6)
+
+t = 3000ms    [MAXIMUM target for normal conditions]
+              All positions flat, audit log written, session halted
+
+MAXIMUM ACCEPTABLE TOTAL TIME (degraded conditions): 5000ms
+(accounts for: marginal network 300ms + Tradier backlog 500ms + partial fills 1200ms)
+```
+
+**Failure path (if Primary doesn't respond within 3000ms):**
+
+```
+t = 4500ms    Primary response timeout detected by mobile app
+              App automatically re-sends kill request to Sentinel only
+              App triggers SMS "KILL" to Twilio kill number as parallel backup
+
+t = 4600ms    Twilio inbound webhook fires kill command to Sentinel independently
+              Sentinel submits close-all via its Tradier close-only permissions
+```
+
+---
+
+### 5.4 CONFIRMATION REQUIRED BEFORE KILL EXECUTES
+
+**Decision: HOLD-TO-KILL (1.5 seconds) with no secondary confirmation screen.**
+
+Rationale: A second "Are you sure?" confirmation screen adds 1–3 additional seconds (reaction time + tap) to the latency. For a 5-second total target, this is unacceptable. The hold gesture itself IS the confirmation — it requires deliberate, sustained intent. It cannot be triggered by a pocket tap, a dropped phone, or a reflexive single touch. The probability of accidental 1.5-second sustained press on a large prominent button is negligible.
+
+During the hold, a single sentence is visible: **"Holding will close ALL positions. Release to cancel."** This gives 1.5 seconds for the operator to reconsider and release if they started the hold accidentally.
+
+**The UI elements explicitly designed against accidental activation:**
+- Button requires `onTouchStart` + continuous monitoring — NOT `onClick`
+- `touch-action: none` CSS prevents scroll gestures from registering as holds
+- `user-select: none` prevents text selection on aggressive hold
+- The button is visually prominent but positioned below the scroll fold — operator must intentionally scroll to it or have it pre-scrolled into view
+
+---
+
+### 5.5 NO INTERNET FALLBACK — THREE LAYERS
+
+**Layer 1 — SMS Kill (works on 2G/EDGE where data apps fail):**
+
+A dedicated Twilio phone number is provisioned exclusively as the kill trigger. When this number receives an SMS containing the text "KILL" (case-insensitive) from the operator's registered phone number, Twilio's inbound webhook fires a POST request to the Sentinel's `/emergency/kill-sms` endpoint. The Sentinel validates the sender's phone number against the operator registry and executes close-all.
+
+Setup during paper phase: operator tests SMS kill from their registered number. Verify Twilio webhook delivery < 8 seconds (Twilio SMS to webhook is typically 2-5 seconds). The total latency with SMS fallback is 8–15 seconds — above the 5-second target but acceptable as a last-resort backup.
+
+**Layer 2 — Sentinel Auto-Kill (requires no operator action):**
+
+The Sentinel independently monitors primary app heartbeat and drawdown. If:
+- Primary app heartbeat lost > 120 seconds (the app may be down and unable to respond to a kill command), OR
+- Drawdown ≥ 3% regardless of app state
+
+The Sentinel executes close-all autonomously. The operator receives SMS notification that Sentinel has acted.
+
+**Layer 3 — Broker-Level Position Limits (requires no network at all):**
+
+Tradier account-level position limits are hardcoded at the broker level. These are enforced independently of any application or Sentinel state. Maximum loss per session is bounded by the OCO hard stops that were submitted at entry. If all application and Sentinel infrastructure fails, positions will still be stopped by their pre-submitted OCO orders.
+
+**The backup hierarchy the operator should know:**
+```
+Internet available          → Mobile app HOLD-TO-KILL    (< 5 seconds)
+Internet degraded           → Retry via Sentinel endpoint (< 5 seconds)
+Only SMS works              → Text "KILL" to kill number  (8–15 seconds)
+No connectivity at all      → Sentinel auto-kills at 3%   (automatic)
+All systems down            → OCO hard stops execute      (broker-level, no app needed)
+```
+
+---
+
+### 5.6 WHAT THE OPERATOR SEES AFTER KILL EXECUTES
+
+**Screen 1 — Kill Executing (appears at t = 1500ms, immediately on kill fire):**
+
+```
+┌─────────────────────────────────────────────────┐
+│  ⚠️  KILL SEQUENCE ACTIVE                        │
+│                                                 │
+│  Closing all positions...                       │
+│                                                 │
+│  SPX IC  5440/5430 5520/5530                   │
+│  ▶ Submitted... ✅ Confirmed                    │
+│                                                 │
+│  SPX CS  5460/5450 (PUT)                        │
+│  ▶ Submitted... ▶ Pending fill...               │
+│                                                 │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  │
+│                                                 │
+│  Session halted. No new positions               │
+│  will open until manually restarted.            │
+└─────────────────────────────────────────────────┘
+```
+
+Position statuses update in real-time via SSE stream from Primary (or Sentinel if primary is down).
+
+Status progression per position: `Submitting` → `Submitted` → `Fill pending` → `✅ Confirmed` OR `⚠️ Retry`
+
+If a position shows `⚠️ Retry` for more than 3 seconds, the app automatically widens the limit order and resubmits (logged in audit trail).
+
+**Screen 2 — Kill Complete (appears when all positions confirmed flat OR 5 seconds have elapsed):**
+
+```
+┌─────────────────────────────────────────────────┐
+│  ✅  ALL POSITIONS CLOSED                        │
+│  Killed at: 10:47:31 EST                        │
+│                                                 │
+│  ─────────────────────────────────────────────  │
+│  Session P&L at kill:    +$418                  │
+│  Positions closed:       2 / 2                  │
+│  Slippage at close:      -$68  (est.)           │
+│  Net locked in:          +$350                  │
+│  ─────────────────────────────────────────────  │
+│                                                 │
+│  Session Status:  ██ HALTED                     │
+│  Primary App:     🟢 Responding                 │
+│  Sentinel:        🟢 Confirmed close            │
+│                                                 │
+│  [VIEW AUDIT LOG]     [RESTART SESSION]         │
+│                                                 │
+│  ────────────── KILL DETAILS ─────────────────  │
+│  Trigger:   Manual (operator tap at 10:47:30)   │
+│  Method:    Primary app kill endpoint           │
+│  Sentinel:  Redundant close confirmed           │
+│  Orders:    2 submitted, 2 confirmed fills      │
+│  Latency:   1.8 seconds (tap → all confirmed)  │
+└─────────────────────────────────────────────────┘
+```
+
+**If any position is NOT confirmed flat after 5 seconds:**
+
+```
+┌─────────────────────────────────────────────────┐
+│  ⚠️  KILL INCOMPLETE — 1 POSITION PENDING        │
+│                                                 │
+│  ✅ SPX IC: Confirmed flat                      │
+│  ⏳ SPX CS: Fill pending (3.2s elapsed)         │
+│             Sentinel backup submitted           │
+│                                                 │
+│  Do NOT restart session until this resolves.   │
+│                                                 │
+│  Estimated resolution: < 30 seconds            │
+│  [CALL TRADIER SUPPORT]  [VIEW AUDIT LOG]       │
+└─────────────────────────────────────────────────┘
+```
+
+[RESTART SESSION] button is locked until all positions are confirmed flat. The operator cannot accidentally restart while a pending close order exists.
+
+---
+
+### 5.7 KILL-SWITCH TESTING DURING PAPER PHASE
+
+The kill-switch is tested against the Tradier sandbox environment. The paper trading system runs against the sandbox API (`https://sandbox.tradier.com/v1/`). Kill-switch tests submit close orders to the sandbox, which simulates fills without touching real capital.
+
+**Required test protocol before go-live (DECISION-013 criterion 7):**
+
+**Test Set A — Latency Validation (10 runs across different times and network conditions):**
+
+```python
+# Test runner to be run manually by operator during paper phase
+async def run_kill_latency_test(
+    network_condition: str,     # 'full_wifi' | 'lte' | 'simulated_degraded'
+    positions_count: int,       # 1, 2, or 3 positions in sandbox
+) -> KillLatencyReport:
+    """
+    Submits paper positions to Tradier sandbox, then executes kill sequence.
+    Measures each component latency.
+    
+    Returns KillLatencyReport with:
+    - tap_to_server_ms: time from hold completion to server receipt
+    - server_to_tradier_ms: time from server receipt to Tradier submission
+    - tradier_to_fill_ms: time from submission to sandbox fill confirmation
+    - total_ms: end-to-end tap to all fills confirmed
+    - sentinel_received_ms: time from tap to Sentinel receipt
+    - sms_fallback_ms: time from SMS send to Sentinel execution (if tested)
+    
+    Acceptance criteria:
+    - total_ms < 3000ms for 95th percentile across all 10 runs
+    - total_ms < 5000ms for ALL runs (zero failures)
+    - tap_to_server_ms < 500ms in all conditions
+    """
+```
+
+**Test Set B — Scenario Tests (6 required scenarios):**
+
+| Test | Scenario | Pass Criteria |
+|---|---|---|
+| B1 | Normal kill: 2 positions open, WiFi | All closed < 3 seconds |
+| B2 | Kill with 3 positions (1 Core + 2 Satellite) | All closed < 5 seconds |
+| B3 | Kill during simulated Tradier latency (+500ms artificial delay) | All closed < 5 seconds |
+| B4 | SMS kill trigger (text "KILL" to Twilio number) | All closed < 15 seconds |
+| B5 | Kill while Primary app artificially unreachable (firewall rule) | Sentinel closes all < 10 seconds |
+| B6 | Kill with no active positions (idempotency test) | No errors, clean "no positions" response |
+
+**Test Set C — Accidental activation resistance:**
+
+Verify that a single tap (< 200ms), a double-tap, and a scroll gesture across the kill button do NOT activate the kill. This is a manual QA test — confirm 0 false activations across 20 deliberate attempts to "accidentally" activate.
+
+**Test Set D — Paper phase timing:**
+- Tests A and B must be completed by Day 20 of paper phase
+- Results documented in `docs/testing/kill-switch-results.md`
+- All 10 runs in Test A must pass before Tests B–D proceed
+- DECISION-013 criterion 7 ("Kill-switch confirmed < 5 seconds response from mobile") is satisfied when Test A 95th percentile < 3000ms and Test B all 6 scenarios pass
+
+**Implementation note — sandbox vs live safety:**
+
+The kill endpoint on Primary FastAPI checks the `ENVIRONMENT` config variable:
+```python
+# In /emergency/kill handler:
+if settings.ENVIRONMENT == 'sandbox':
+    tradier_api_url = "https://sandbox.tradier.com/v1/orders"
+elif settings.ENVIRONMENT == 'live':
+    tradier_api_url = "https://api.tradier.com/v1/orders"
+```
+
+The mobile app displays a prominent orange banner during paper phase: **"PAPER TRADING — Kill triggers sandbox orders only."** The banner disappears when `ENVIRONMENT == 'live'`. This prevents the operator from forgetting which environment they're testing against.
+
+---
+
+## SUMMARY — WHAT THIS SPECIFICATION DELIVERS
+
+**For Q1 (Charm/Vanna Calibration):**
+A complete, buildable data pipeline that logs 30 fields per 5-minute CV_Stress reading into TimescaleDB, a precise outcome labeling methodology using 20-minute forward P&L, a cost-weighted threshold optimization function (CWER with 3:1 FN:FP weighting), exact false-positive (≤ 20%) and false-negative (≤ 15% target, ≤ 25% hard floor) budgets, a weekly Python recalibration function runnable from the first Sunday of paper trading, minimum data requirements (15 EXIT triggers, 20 LOSS events, 100 total observations per strategy type), and differentiated treatment for debit verticals whose charm/vanna interpretation is inverted relative to short-gamma strategies.
+
+**For Q5 (Kill-Switch UX):**
+A complete mobile PWA specification with 5-second latency target achieved through three-layer redundancy (Primary + Sentinel + SMS), hold-to-kill UX that prevents accidental activation, exact step-by-step kill sequence with per-step latency targets, three-layer no-internet fallback (SMS kill → Sentinel auto-kill → OCO hard stops), a complete set of paper-phase test protocols with specific pass/fail criteria that satisfy DECISION-013 criterion 7, and operator-facing screens for all kill states including incomplete fill handling.
+
+---
+
+*Round 3 response by: Claude (Anthropic)*  
+*Date: 2026-04-15*  
+*Repo: https://github.com/tesfayekb/market-muse.git*  
+*Ready for: FINAL_SPEC.md integration*
