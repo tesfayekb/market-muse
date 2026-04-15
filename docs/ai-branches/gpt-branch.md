@@ -516,166 +516,342 @@ In short: this proposal is built not to be the smartest-looking system, but to b
 
 ---
 
-## Overview
+## MATHEMATICAL AUDIT — PILLAR 1
 
-The biggest pattern is that the synthesis is strong architecturally, but many quantitative claims are stated as if established facts when they are really hypotheses that still need validation.
+**Claim:** "Pillar 1: Prediction Engine | Confidence: HIGH | Strong agreement on core architecture; GEX validated by 3 of 4 AIs"
 
----
-
-## Pillar 1: Prediction Engine — QUESTIONABLE
-
-The synthesis makes several unsupported quantitative claims.
-
-First, it says the pillar confidence is high because "GEX validated by 3 of 4 AIs," but **AI agreement is not evidence of predictive validity.** There is no backtest, ablation, or live paper result showing that GEX improves directional accuracy, strike-touch prediction, or EV ranking in this repo state. The same problem appears in the claim that VVIX leads VIX by 15–60 minutes on the majority of vol spikes. That may be directionally plausible, but the document provides no dataset, sample definition, or hit-rate analysis. Those should be treated as hypotheses until tested.
-
-The **Day Type classifier** is proposed as a hard gate trained on 5 years of SPX 5-minute data, but the synthesis gives no class-balance analysis, no label-definition method, and no estimate of how many true examples of each archetype exist. "Trend Day," "Reversal Day," and "Event Day" are not objective enough yet for clean supervised learning. Hard-gating trade eligibility off noisy labels risks false vetoes and false approvals. That is a logic gap, not just a modeling detail.
-
-The stated thresholds are also shaky. A neutral call when |P_bull − P_bear| < 0.15 is arbitrary. It may be reasonable, but there is no calibration evidence. Likewise, "RCS drops to low conviction tier if no single regime exceeds 60% probability" is a policy threshold, not a mathematically justified one. Those should be explicitly marked as starting priors pending calibration.
-
-On ML architecture, HMM plus LightGBM is sensible for tabular, regime-conditioned intraday work, and it fits the stated latency budget better than deep sequence models. That part holds up better than most of the synthesis. The broker constraint says signal generation should target under 500 ms and total signal-to-fill under 1.5 seconds ideal, 5 seconds max. Gradient boosting and HMM are compatible with that; heavier transformer models are not obviously compatible unless used offline or for slower layers. So the ML choice is broadly appropriate, but the feature volume and refresh cadence need discipline. The system proposes 87 features, chain snapshots, GEX recomputation, and multiple layers every 5 minutes; that is feasible, but only if data joins and feature generation are precomputed and cache-heavy.
-
-### Correction
-
-Reframe Pillar 1 claims as "candidate predictive drivers," and require three validations before any are treated as structural truth:
-
-1. Out-of-sample directional lift
-2. Strike-touch calibration
-3. Net EV improvement after slippage
+**Status:** UNSUPPORTED  
+**Reasoning:** Agreement among AI branches is not validation. No backtest, ablation study, live paper result, or out-of-sample error table is provided showing that GEX improves directional accuracy, strike-touch calibration, or net EV after costs. This is a confidence claim presented as evidence.  
+**Fix:** Replace with measurable criteria: "HIGH only if GEX adds statistically significant lift in out-of-sample Brier score, calibration, or net EV versus a no-GEX baseline."
 
 ---
 
-## Pillar 2: Strategy Selection Engine — QUESTIONABLE
+**Claim:** "Before any trade is considered, classify the current trading day into one of five archetypal structures using LightGBM trained on 5 years of SPX 5-minute data"
 
-The strongest idea here is the EV-based utility framework. Logically, that is the right direction. But the synthesis treats the utility score as if it were immediately operational, even though several inputs are not yet reliably measurable. EV_net, ExpectedShortfall, TailRisk, SlippagePenalty, and LiquidityPenalty all depend on robust path simulation and realistic fill modeling. The constraints documents repeatedly warn that slippage can dominate returns, especially at the open and in volatile conditions. Without a validated fill model, the utility function can look precise while being materially wrong.
-
-The hard liquidity thresholds also need caution. The synthesis uses open interest < 500, daily volume < 100, and bid/ask > $0.30 as vetoes, with a special RUT exception. Those are operationally clean, but not universally valid. A $0.30 spread on a wide-wing structure may be acceptable in percentage terms, while a $0.20 spread on a tiny-credit structure may be terrible. **A fixed-dollar spread rule should probably be paired with a relative rule**, such as spread as a percent of midpoint or of max profit. As written, the logic is internally inconsistent with the emphasis on after-cost EV.
-
-The claim that positive GEX walls provide "natural defense" for short strikes and that negative GEX flip zones are "hard veto" areas is also unsupported in the current documents. This may be useful market structure intuition, but it is not yet validated enough to be hard-coded as a universal strike placement rule. GEX can matter, but its effects are state-dependent and may fail badly on event days, gap days, and liquidity-stress days.
-
-### Correction
-
-Keep the 4-stage selection logic, but downgrade GEX strike rules from hard truths to priors until paper/live evidence shows:
-
-1. Slippage-adjusted fill advantage
-2. Lower short-strike breach rate
-3. Better realized EV than delta-based or volatility-based placement
+**Status:** QUESTIONABLE  
+**Reasoning:** The output is only as good as the labels. The synthesis never defines an objective labeling rule for Trend Day, Open-Drive Day, Range Day, Reversal Day, and Event Day. Without deterministic labels, the model cannot produce the claimed classifier reliably. This is a circular design: strategy eligibility depends on day type, but day type itself is not rigorously defined.  
+**Fix:** Define label rules numerically first, for example by open-to-close return, first-hour reversal magnitude, realized intraday range, and event flags, then report class counts and class imbalance.
 
 ---
 
-## Pillar 3: Risk Management Engine — QUESTIONABLE
+**Claim:** "If probability of any single regime < 60%, RCS drops to Low Conviction tier"
 
-This pillar has the most important math problem in the document: **the proposed position sizing formula is dimensionally weak.**
-
-```
-Position Size = (Account Value × Risk % × RCS/100) 
-              / (GEX-adjusted expected move × $100 multiplier)
-```
-
-That formula mixes forecast magnitude with contract multiplier, but it does not clearly map to actual strategy loss per contract. For a credit spread, risk is width minus credit, not expected move times multiplier. For a debit spread, risk is debit paid. For a long option, risk is premium paid but price sensitivity is nonlinear. So **this sizing formula is not strategy-consistent** and will mis-size trades under stress. It should not be used as written.
-
-### Corrected Formula
-
-A better formulation is:
-
-```
-position_count = allowed_dollar_risk / stressed_loss_per_structure
-```
-
-Where stressed loss is the worse of:
-- Hard max loss
-- Model-based adverse move loss
-- Slippage-expanded exit loss
-
-The Greek limits also look more like placeholders than validated thresholds. Max position delta of ±0.15 per $100k and max vega ±$500 per $100k may be fine as starting controls, but there is no evidence they jointly fit the target drawdown profile. The execution risk document explicitly shows how gamma can explode intraday on 0DTE. Yet the synthesis does not specify a direct gamma cap beyond time-based exit rules. **If gamma is the account destroyer, gamma should have a quantified intraday stop framework**, not just a 2:30 PM blanket exit.
-
-The VVIX threshold ladder (>120, >140, >160 and 20% rise in 30 minutes) may be sensible heuristic alarms, but there is no evidence in the repo that these levels align with actual deterioration in SPX 0DTE edge. They should be marked "provisional."
-
-The margin cap of 70% is consistent with broker constraints. The -3% daily stop is a locked owner decision and internally consistent. What is not yet consistent is the combination of large Core allocation ambitions with a 0.5% core trade risk and only three open positions. The capital allocation language sounds aggressive, but the risk rules sound conservative. **Those can coexist, but the synthesis does not reconcile them quantitatively.**
-
-### Correction
-
-Replace the current sizing formula with structure-specific risk sizing and run stress tests across:
-
-1. Gap-through-stop
-2. Widened spreads
-3. Delayed fills
-4. Correlated multi-position losses
+**Status:** UNSUPPORTED  
+**Reasoning:** The 60% threshold is arbitrary in the document. No calibration analysis is provided showing that sub-60% regime confidence actually predicts lower edge or worse live P&L. Since the system uses this as a hard capital gate, this threshold directly affects return and opportunity cost.  
+**Fix:** Tune the threshold on out-of-sample results using expected net P&L and regret from false no-trade decisions.
 
 ---
 
-## Pillar 4: Monitoring & Dashboard Engine — VALID, WITH A LIMIT
+**Claim:** "VVIX leads VIX by 15–60 minutes on majority of vol spikes"
 
-This pillar is mostly about observability, so the audit issue is not whether the UI idea is good, but whether the quantitative displays are actionable and properly prioritized.
-
-The **P&L heatmap** is a valid idea. Showing ±0.5%, ±1%, ±2%, ±5% scenarios over 15/30/60 minutes is useful if it is powered by structure-aware pricing rather than a naive linear approximation. If the heatmap is just based on static Greeks, it will understate nonlinear 0DTE behavior, especially gamma and vega shifts. So the display concept is valid, but **its implementation must use repricing under scenario shocks, not only Greek extrapolation.**
-
-The Sentinel concept is logically useful for human-approval V1, but any claims in its sample outputs about event frequencies, such as "observed in 7 of the last 10 major vol events," are unsupported in the synthesis. Those kinds of percentages should not appear in production explanations unless directly computed from stored evidence.
-
-The alert tiers are reasonable. The problem is that some thresholds mix causes and effects. For example, VVIX +20% is listed as critical in the dashboard alerts, while the risk pillar already uses a 20% VVIX rise in 30 minutes as a warning/reduction condition. That is not necessarily inconsistent, but it needs clearer hierarchy.
-
-### Correction
-
-Declare that dashboard scenario P&L must be repriced from full structure snapshots and current IV assumptions, not from first-order Greeks alone.
+**Status:** UNSUPPORTED  
+**Reasoning:** This is one of the most important numerical claims in the whole synthesis, and there is no supporting study, sample size, or event definition. "Majority" is unquantified and unproven here. The risk logic later depends on this claim.  
+**Fix:** Backtest event windows with precise definitions: what counts as a vol spike, what lag metric is used, and what the hit rate and false-alarm rate are.
 
 ---
 
-## Pillar 5: Exit Strategy Engine — QUESTIONABLE
+**Claim:** "Layer B Feature Pipeline (87 features total)"
 
-This pillar contains one of the strongest practical ideas in the synthesis and one of its weakest mathematical statements.
-
-The strong idea is the **earlier 2:30 PM mandatory exit for short-gamma.** Given the explicit broker and execution constraints showing severe spread degradation late in the day and the execution-risk warning on 0DTE gamma acceleration, an earlier short-gamma cutoff is directionally sensible. But the synthesis overstates certainty when it says the remaining theta is only around $0.05–$0.15 and that this captures 85% of theta while avoiding 90% of terminal gamma risk. Those are quantitative claims with no supporting study in the document.
-
-### Critical Mathematical Issue
-
-The biggest mathematical issue is the strike-touch formula:
-
-```
-Strike_Touch_Probability = N(d2 adjusted for remaining time and realized vol)
-```
-
-**As written, that is not a proper touch-probability formula.** In Black-Scholes-type models, N(d2) is tied to risk-neutral terminal exercise probability, not first-passage touch probability. Touch probability is a different object and is generally higher than terminal ITM probability. Using an adjusted N(d2) shortcut may be acceptable as a heuristic proxy, but it is mathematically mislabeled. This should be corrected immediately, because it affects the central exit logic for 0DTE credit trades.
-
-The state-based exit framework is logically strong. The thresholds (40% max profit captured, confidence drop >15 points, touch probability >25% scale-out, 40% full exit) are fine as initial heuristics, but currently unsupported. They should be explicitly marked as tunable priors.
-
-### Correction
-
-1. Rename the metric to "breach-risk score" unless a true first-passage model is implemented.
-2. If true touch probability is desired, use either barrier-hitting approximations or a calibrated Monte Carlo/local-vol approach.
-3. Validate whether 2:30 PM is best by backtesting 1:30, 2:00, 2:30, and 3:00 PM exits on short-gamma structures with realistic fills.
+**Status:** QUESTIONABLE  
+**Reasoning:** The issue is not feature count alone. It is whether the system can generate and update those features within the latency budget. Prediction inference is budgeted at under 300 ms target, 1 s max, and feature engineering under 200 ms target, 500 ms max. An 87-feature stack with chain-derived GEX, vol surface features, options flow, and cross-asset joins every 5 minutes may be feasible, but only if heavily cached and precomputed. The synthesis does not show that path from inputs to latency budget.  
+**Fix:** Produce a latency profile of real feature generation times. Any feature exceeding the budget must be precomputed, dropped, or moved off the critical path.
 
 ---
 
-## Pillar 6: Learning & Adaptation Engine — QUESTIONABLE
+**Claim:** "Neutral declared if |P_bull − P_bear| < 0.15"
 
-The two-speed learning loop is logically appropriate. The biggest problem is the **sample-size math.**
+**Status:** UNSUPPORTED  
+**Reasoning:** This threshold is a policy guess. It is not tied to calibration, expected value, or class-conditional error. A 0.14 spread may still carry meaningful edge; a 0.20 spread may still be noise if probabilities are miscalibrated.  
+**Fix:** Base neutrality on calibrated EV after friction, not raw probability spread alone.
 
-The synthesis says a rolling 5-trade accuracy below 58% triggers drift alert, rolling 20-trade accuracy more than 10 points below historical average cuts sizing by 50%, and about 200 trades per strategy/regime combination are needed for statistical significance. These numbers are all plausible as operational heuristics, but none is supported by uncertainty analysis. **Five trades is far too small to infer much about model drift.** Twenty trades is still noisy. Even 200 trades per strategy/regime cell may be inadequate if payoff distributions are fat-tailed and regimes are heterogeneous.
+---
 
-There is also an internal consistency issue. The system targets 1–3 trades per day and many structure/regime combinations. The synthesis itself notes that 200 trades per combination could take 3–6 months, but that estimate is optimistic for multiple regimes and strategies; for some combinations it may take much longer. That means weekly retraining and adaptation will likely be operating on sparse, unstable subgroup samples for a long time. The architecture is fine, but the adaptation cadence may be too eager relative to data volume.
+## MATHEMATICAL AUDIT — PILLAR 2
 
-The ML architecture itself is appropriate: LightGBM/XGBoost plus champion/challenger is well matched to tabular financial features and latency constraints. The warning is not about model class; it is about governance. You need stronger minimum-evidence thresholds before changing production behavior.
+**Claim:** "The highest-utility strategy wins. EV is never overridden by 'feel' or regime intuition."
 
-### Correction
+**Status:** QUESTIONABLE  
+**Reasoning:** This is only valid if EV is estimated correctly. The utility function depends on EV_net, ExpectedShortfall, TailRisk, SlippagePenalty, LiquidityPenalty, and CapitalEfficiency, but the synthesis does not specify how these are estimated from the described inputs in a way that is calibrated to real fills. Without a validated slippage model, the "highest utility" may just be the most mis-modeled strategy.  
+**Fix:** Require strategy ranking to use empirical fill and slippage distributions from paper/live shadow trading before any EV ranking is trusted.
 
-1. Use Bayesian or confidence-interval-based drift logic, not raw 5-trade and 20-trade thresholds alone.
-2. Separate calibration updates from policy updates.
-3. Require larger evidence windows before changing sizing or regime-strategy mappings.
+---
+
+**Claim:** "Short strikes for credit spreads: Place at Positive GEX Wall or beyond — mechanical dealer hedging provides natural defense"
+
+**Status:** UNSUPPORTED  
+**Reasoning:** This is a structural market claim presented as a rule. No evidence is shown that positive GEX walls consistently reduce short-strike breach probability enough to improve net EV after slippage. On event days and trend days, these "natural defense" assumptions can fail hard.  
+**Fix:** Validate with a strike-placement study comparing GEX-wall placement against delta-based and expected-move-based placement.
+
+---
+
+**Claim:** "No strike may be placed within 0.3% of a Negative GEX Flip zone on a short-gamma structure"
+
+**Status:** UNSUPPORTED  
+**Reasoning:** The 0.3% threshold is specific but unexplained. There is no derivation, no empirical distribution, and no sensitivity analysis. This can easily be too wide on calm days and too narrow on volatile days.  
+**Fix:** Make this a volatility-scaled threshold, for example as a fraction of intraday expected move, and validate it.
+
+---
+
+**Claim:** "Bid/ask spread > $0.30 on any single leg → veto the entire structure"
+
+**Status:** CONTRADICTED  
+**Reasoning:** The same document later allows RUT up to $0.40 per leg in locked owner decisions. Also, a fixed-dollar spread threshold contradicts the utility framework's emphasis on after-cost EV: a $0.30 spread may be acceptable on a large-credit or wide-wing structure and unacceptable on a tiny-premium structure. The rule is absolute where the rest of the pillar argues for relative EV.  
+**Fix:** Use spread as a percent of mid or of max profit, with instrument-specific caps.
+
+---
+
+**Claim:** "Open interest < 500 or daily volume < 100 on any leg → veto"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** These are practical heuristics, not mathematically justified thresholds. The broker constraints mention these values as selection preferences, but the synthesis upgrades them into absolute vetoes without showing that these cutoffs maximize profit.  
+**Fix:** Treat them as starting filters and validate realized slippage and fill success rate around the boundary.
+
+---
+
+**Claim:** "Credit spreads, iron condors, debit verticals" as primary 0DTE structures
+
+**Status:** QUESTIONABLE  
+**Reasoning:** The architecture assumes the model can forecast enough of path and vol to select among these structures reliably. That is exactly what is not yet validated. The issue is not that the structures are wrong; it is that the synthesis treats the model-to-structure mapping as already trustworthy.  
+**Fix:** Require shadow ranking of selected strategy versus top-3 alternatives before production trust.
+
+---
+
+## MATHEMATICAL AUDIT — PILLAR 3
+
+**Claim:** "Position Size = (Account Value × Risk % × RCS/100) / (GEX-adjusted expected move × $100 multiplier)"
+
+**Status:** CONTRADICTED  
+**Reasoning:** This formula does not correctly size options structures. For a credit spread, worst-case loss is width minus credit. For a debit spread, risk is debit paid. For an iron condor, risk depends on the wider spread minus net credit. Dividing by expected move times multiplier is not dimensionally consistent with structure-specific loss per contract. This formula can understate or overstate risk dramatically.  
+**Fix:** Use structure-specific stressed loss per contract as the denominator: max loss or slippage-expanded adverse-loss estimate, whichever is worse.
+
+---
+
+**Claim:** "Risk % per core trade: 0.5% of account"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** This might be reasonable, but it is not reconciled with the locked capital allocation framework, 3-position max, 70% margin cap, and -3% daily stop. Depending on spread widths and instrument choice, a 0.5% core risk may imply much lower deployable capital than the narrative suggests. The synthesis never ties position sizing to expected trade frequency and stop-out clustering.  
+**Fix:** Run portfolio stress tests with correlated losses, partial fills, and widened spreads to see whether the actual heat profile fits the daily stop logic.
+
+---
+
+**Claim:** "Maximum position delta: ±0.15 net portfolio delta per $100k account value"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** The wording itself is inconsistent: "maximum position delta" but expressed as "net portfolio delta." Also, no derivation is given showing that this delta cap aligns with the target max drawdown under realistic SPX intraday shocks.  
+**Fix:** Separate per-position and portfolio delta caps, then derive them from scenario-loss limits.
+
+---
+
+**Claim:** "Maximum gamma: as defined by 2:30 PM mandatory exit rule"
+
+**Status:** CONTRADICTED  
+**Reasoning:** This is not a gamma threshold. It replaces a quantitative risk measure with a clock. The execution risk document explicitly says gamma must be exited if it exceeds a defined threshold, not only when time reaches a cutoff.  
+**Fix:** Add a true gamma cap or a scenario-based nonlinear P&L cap.
+
+---
+
+**Claim:** "VVIX > 120 / >140 / >160" ladder
+
+**Status:** UNSUPPORTED  
+**Reasoning:** These thresholds may be sensible operational heuristics, but they are presented as if they were evidence-based. There is no calibration showing that these levels produce acceptable false-positive and false-negative tradeoffs.  
+**Fix:** Backtest threshold ladders and choose cut points from actual regime transition and P&L damage curves.
+
+---
+
+**Claim:** "If any pre-market scan produces a WARNING or higher → reduce day's allocation tier by one step"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** This is simple, but mathematically ungrounded. Different warnings have very different risk implications. A mild margin issue and a severe VVIX warning should not mechanically map to the same one-step reduction.  
+**Fix:** Weight warnings by estimated impact on expected shortfall, not by a flat step-down rule.
+
+---
+
+## MATHEMATICAL AUDIT — PILLAR 4
+
+**Claim:** "Scenario P&L Heatmap" showing portfolio value at SPX ±0.5/1/2/5% over 15/30/60 min
+
+**Status:** QUESTIONABLE  
+**Reasoning:** The display is useful only if it is computed by repricing each structure under scenario shocks to price, vol, and time. The synthesis does not say how it is calculated. If it is based only on current Greeks, it will understate nonlinear 0DTE behavior badly.  
+**Fix:** Require full scenario repricing, not first-order Greek approximation.
+
+---
+
+**Claim:** "VVIX has risen 18% in the last 25 minutes while VIX is still calm. This is a pre-spike pattern observed in 7 of the last 10 major vol events."
+
+**Status:** UNSUPPORTED  
+**Reasoning:** This sample output embeds an unsupported event-study statistic. There is no evidence shown for "7 of the last 10." The Sentinel should not invent numerical authority.  
+**Fix:** Any numerical explanation produced by Sentinel must come from tracked, queryable system evidence.
+
+---
+
+**Claim:** "Prediction confidence has dropped from 72% to 54% ... Consider early exit"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** This assumes the prediction probabilities are calibrated and comparable through time. That calibration has not been demonstrated anywhere in the synthesis. Uncalibrated confidence decay is not a mathematically safe exit signal.  
+**Fix:** Use confidence changes only after probability calibration is proven stable by regime and time-of-day.
+
+---
+
+**Claim:** "WARNING | VVIX +15%, RCS drops below 50, position approaching SL by 30%"
+
+**Status:** CONTRADICTED  
+**Reasoning:** This conflicts with earlier VVIX logic using +20% in 30 minutes and >120 absolute level for warnings. The alert system mixes thresholds inconsistently across sections, which will create contradictory state transitions.  
+**Fix:** Centralize one canonical threshold table reused by risk, dashboard, and sentinel.
+
+---
+
+**Claim:** "Daily Drawdown proximity alert at -2%"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** Reasonable operationally, but unexplained mathematically. There is no evidence that -2% is the right early-warning point relative to the -3% hard stop, given expected fill degradation and latency.  
+**Fix:** Tune the alert threshold using actual stop-execution slippage and time-to-intervention data.
+
+---
+
+**Claim:** "Approval Queue" and "real-time"
+
+**Status:** CONTRADICTED  
+**Reasoning:** The synthesis adds an 8-minute approval window, but the latency budget's critical path is built around sub-second signal-to-fill assumptions. Human approval removes the system from that low-latency world. That is fine because human approval is locked, but the synthesis still speaks like it can preserve the same mathematical edge despite multi-minute latency.  
+**Fix:** Explicitly distinguish machine-timing edge from human-approved timing reality; re-evaluate every recommendation at approval time.
+
+---
+
+## MATHEMATICAL AUDIT — PILLAR 5
+
+**Claim:** "The gamma risk from 2:30–3:45 PM on short-gamma 0DTE positions is empirically not worth the remaining theta capture"
+
+**Status:** UNSUPPORTED  
+**Reasoning:** This may be true, but the synthesis shows no empirical study. It also quantifies later that the last window offers only about $0.05–$0.15 and that this captures 85% of theta while avoiding 90% of terminal gamma risk. Those are precise-looking numbers without support.  
+**Fix:** Backtest exit-time ladders with realistic fills: 1:30, 2:00, 2:30, 3:00, and 3:30 PM.
+
+---
+
+**Claim:** "Strike_Touch_Probability = N(d2 adjusted for remaining time and realized vol)"
+
+**Status:** CONTRADICTED  
+**Reasoning:** This is mathematically wrong as written. N(d2) is tied to terminal exercise probability under risk-neutral assumptions, not first-passage touch probability. Touch probability and terminal ITM probability are not the same object. Since this formula is central to the exit logic, this is a major error.  
+**Fix:** Either use a true barrier-touch approximation or rename the metric to a breach-risk proxy and validate it against realized strike touches.
+
+---
+
+**Claim:** "Strike-touch probability < 10%: take 60% of max credit, exit position"
+
+**Status:** UNSUPPORTED  
+**Reasoning:** The threshold values 10%, 25%, and 40% are entirely unsupported. They may be usable as initial priors, but the synthesis treats them as already defensible rules.  
+**Fix:** Tune thresholds on historical plus paper/live shadow data and report net-EV sensitivity.
+
+---
+
+**Claim:** "At 40–50% of max credit captured → take 50% off" and "At 65–70% → close 100%"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** These are practical rules, but they are not derived from the model outputs described earlier. They are manual heuristics layered onto an otherwise model-driven architecture. That is not fatal, but it is logically inconsistent with the claim that exits are "state-based" and distribution-aware.  
+**Fix:** Either admit these are heuristic priors or derive them from expected remaining theta versus breach risk.
+
+---
+
+**Claim:** "Prediction confidence dropped >15 pts from entry" as degrading thesis
+
+**Status:** QUESTIONABLE  
+**Reasoning:** Again, this assumes confidence is calibrated and stable through time. No calibration proof is provided. A 15-point drop may mean very different things depending on regime and base rate.  
+**Fix:** Use a calibrated likelihood-ratio or EV deterioration threshold instead of raw confidence-point loss.
+
+---
+
+**Claim:** "Hard price stop: always pre-defined and pre-submitted as OCO at entry"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** Operationally correct, but options stop behavior can be unstable when spreads are wide or quotes gap. The synthesis treats pre-submitted OCO as if it guarantees mathematically controlled exits. It does not. Execution risks document partial fills, delayed fills, and wide slippage.  
+**Fix:** Model stop execution as slippage-expanded and include stop-failure scenarios in stress tests.
+
+---
+
+## MATHEMATICAL AUDIT — PILLAR 6
+
+**Claim:** "Fast Loop — Daily" and "Slow Loop — Weekly"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** Architecturally sensible, but the synthesis does not reconcile this cadence with actual data volume. With roughly 1–3 trades per day and many strategy/regime combinations, weekly adaptation can be data-starved for a long time. The document later admits around 200 trades per strategy/regime combination are needed for significance, which clashes with frequent adaptation.  
+**Fix:** Separate calibration updates from behavioral policy changes; require much stronger evidence for sizing and mapping changes.
+
+---
+
+**Claim:** "Flag any sessions where model accuracy < 58% for review"
+
+**Status:** UNSUPPORTED  
+**Reasoning:** A single session can have very few trades, making session-level directional accuracy extremely noisy. The 58% target comes from the brief, but applying it at session level is mathematically weak.  
+**Fix:** Use confidence intervals over rolling windows, not raw single-session hit rates.
+
+---
+
+**Claim:** "Promote challenger only after ... Sharpe improvement > 0.1"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** A Sharpe delta of 0.1 is not meaningful without sample length and uncertainty. Over short windows it is noise. The synthesis gives no statistical test, no confidence interval, and no minimum observation count.  
+**Fix:** Require significance tests or Bayesian posterior dominance over a defined minimum sample.
+
+---
+
+**Claim:** "Challengers run in shadow for minimum 20 live trading sessions"
+
+**Status:** QUESTIONABLE  
+**Reasoning:** Twenty sessions may be enough for operational smoke testing, but not enough for robust statistical comparison across multiple regimes, especially if trade count is low or clustered.  
+**Fix:** Base promotion on trade count and regime coverage, not sessions alone.
+
+---
+
+**Claim:** "If rolling 5-trade prediction accuracy drops below 58% → trigger model drift alert"
+
+**Status:** CONTRADICTED  
+**Reasoning:** Five trades is too small to infer drift meaningfully. This is statistically noisy and will trigger false alarms. It is inconsistent with the same synthesis later saying around 200 trades per strategy/regime combination are needed for statistical significance.  
+**Fix:** Use drift tests based on larger samples, calibration error, and prediction-score deterioration, not only 5-trade hit rate.
+
+---
+
+**Claim:** "If drift persists > 3 sessions → automatically promote challenger ... else halt ... and run in pure-GEX-structural mode"
+
+**Status:** UNSUPPORTED  
+**Reasoning:** This assumes pure-GEX mode is a reliable fallback. That has never been validated in the synthesis. It also risks promoting challengers on very little evidence.  
+**Fix:** Replace with "de-risk and reduce trade frequency" until sufficient evidence exists, rather than switching to an unproven fallback.
 
 ---
 
 ## THE 3 NUMBERS THAT WILL MAKE OR BREAK THIS SYSTEM
 
-### 1. Real slippage per round trip, by structure and time of day
+### 1. Realized round-trip slippage by strategy, instrument, and time-of-day
 
-This is the most important number because the entire EV framework can be invalidated if fill friction is understated. The constraints docs already show that slippage ranges from modest midday to catastrophic at the open and during volatility spikes. Measure actual fill minus model midpoint, by instrument, strategy, hour, and volatility regime. Then feed that into strategy ranking and no-trade logic.
+Why it matters: the utility function, no-trade logic, and exit quality all collapse if fill friction is understated. Open, event, and late-day slippage can erase nominal edge fast. The constraints docs already show that slippage can consume a large fraction of max credit.  
+How to get it right: log actual fill versus decision-time mid and versus executable limit, segmented by structure, hour, VVIX regime, and approval delay.
 
-### 2. Probability calibration of the forecast engine
+### 2. Calibration of predicted probabilities and EV, not just hit rate
 
-Not raw accuracy alone. A 58% hit rate is not enough if the confidence estimates are badly calibrated. The system's gates, no-trade logic, and position sizing all depend on whether a stated 70% conviction really behaves like 70%. Track Brier score, calibration curves, and regime-conditional reliability before letting confidence drive size. The brief's 58% directional target is only meaningful if probabilities are honest.
+Why it matters: the synthesis uses confidence for gating, sizing, exits, and no-trade decisions. Uncalibrated probabilities make all of those numerically dangerous.  
+How to get it right: track Brier score, reliability curves, regime-conditional calibration, and realized net EV versus predicted net EV.
 
-### 3. Stress loss per position, not model-expected loss
+### 3. Stressed loss per position under slippage-expanded exits
 
-This should be the denominator for sizing. If you get this wrong, the whole system can blow through its daily stop. For each strategy, define a stressed loss that includes adverse move, spread widening, and imperfect exit. Then size from that, not from expected move alone. This is the correction most needed for the current Pillar 3 math.
+Why it matters: current sizing math is the weakest numerical link. If the denominator is wrong, the daily stop and drawdown targets are fiction.  
+How to get it right: size positions from the worse of max structural loss and scenario loss under adverse move + widened spread + delayed exit, not from expected move alone.
+
+---
+
+## WHAT THE SYNTHESIS GETS MATHEMATICALLY WRONG ABOUT PROFIT
+
+The biggest numerical error is that it repeatedly treats modeled edge as monetizable edge without proving that the edge survives human approval delay, slippage, spread widening, and structure-specific loss geometry.
+
+The clearest example is the combination of:
+
+- distribution-first EV ranking,
+- sub-second latency budgets,
+- an 8-minute human approval window,
+- and a flawed position-sizing denominator based on expected move.
+
+That stack overstates profit in two ways:
+
+- it assumes stale recommendations remain close enough to their original EV after multi-minute delay, and
+- it sizes options structures from a forecast variable that is not the same thing as actual dollar risk.
+
+That is the synthesis's central mathematical weakness. Until recommendation decay, real slippage, and structure-specific stressed loss are measured and inserted into ranking and sizing, the document is numerically more optimistic than defensible.
 
 ---
 
